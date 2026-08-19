@@ -17,6 +17,7 @@ always-available random tracker station useful and enjoyable?
 - Continuous play, pause, resume, skip, stop, and persistent in-menu volume control
 - Live elapsed and estimated total time with seeking for libxmp-backed tracks
 - In-memory background prefetching for near-immediate transitions and skips
+- Native macOS Now Playing, Control Centre, and keyboard media controls
 - Song title and available artist attribution
 - Links to the current song in BassoonTracker and The Mod Archive
 - Bundled libxmp-lite replay engine with no external runtime installation
@@ -41,6 +42,13 @@ While one track plays, the next alternating MOD or XM is downloaded, validated,
 and held in memory. Natural completion and **Play Another Track** consume that
 ready slot immediately, then refill it in the background. No module data is
 written outside the app's process.
+
+ModRadio publishes its current title, artist, duration, elapsed time, and
+playback state through Apple's MediaPlayer framework. The Mac media controls map
+play/pause to pause and resume, next to the prefetched track, previous to the
+start of the current track, and supported skip controls to 15-second seeks.
+This uses the system Now Playing session and requires no accessibility access,
+event taps, global keyboard monitoring, or additional sandbox entitlement.
 
 ## Build
 

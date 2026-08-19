@@ -3,6 +3,7 @@ import AudioToolbox
 import AVFoundation
 import CLibXMP
 import Foundation
+import MediaPlayer
 
 // MARK: - Remote catalogue
 
@@ -1057,6 +1058,21 @@ private final class RadioController {
         beginNewGeneration(with: prepared)
     }
 
+    func playForVerification(track: RadioTrack, module: TrackerModule) {
+        stationIsOn = true
+        playbackGeneration = UUID()
+        let generation = playbackGeneration
+        task?.cancel()
+        prefetchTask?.cancel()
+        task = nil
+        prefetchTask = nil
+        prefetchedTrack = nil
+        waitingForPrefetch = false
+        audioPlayer.stop()
+        startPlayback(PreparedTrack(track: track, module: module),
+                      generation: generation, shouldPrefetch: false)
+    }
+
     func togglePause() {
         switch phase {
         case .playing:
@@ -1185,7 +1201,8 @@ private final class RadioController {
         task?.resume()
     }
 
-    private func startPlayback(_ prepared: PreparedTrack, generation: UUID) {
+    private func startPlayback(_ prepared: PreparedTrack, generation: UUID,
+                               shouldPrefetch: Bool = true) {
         guard isCurrent(generation) else { return }
         waitingForPrefetch = false
         track = RadioTrack(
@@ -1203,7 +1220,7 @@ private final class RadioController {
             unsupportedSkips = 0
             prefetchFailures = 0
             phase = .playing
-            prefetchNextTrack(generation: generation)
+            if shouldPrefetch { prefetchNextTrack(generation: generation) }
         } catch {
             phase = .failed("The Mac audio engine could not start.")
         }
@@ -1294,6 +1311,198 @@ private final class RadioController {
     }
 }
 
+// MARK: - macOS Now Playing and media keys
+
+private final class SystemMediaController: NSObject {
+    private weak var radio: RadioController?
+    private let commandCenter = MPRemoteCommandCenter.shared()
+    private let informationCenter = MPNowPlayingInfoCenter.default()
+    private var isRegistered = false
+
+    init(radio: RadioController) {
+        self.radio = radio
+        super.init()
+        registerCommands()
+        update()
+    }
+
+    deinit { invalidate() }
+
+    func update() {
+        guard let radio else { return }
+        updateCommandAvailability(for: radio)
+
+        guard let track = radio.track, radio.phase != .stopped else {
+            informationCenter.nowPlayingInfo = nil
+            informationCenter.playbackState = .stopped
+            return
+        }
+
+        let progress = radio.playbackProgress
+        var information: [String: Any] = [
+            MPMediaItemPropertyTitle: track.displayTitle,
+            MPMediaItemPropertyAlbumTitle: "ModRadio",
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: progress?.elapsed ?? 0,
+            MPNowPlayingInfoPropertyPlaybackRate: radio.phase == .playing ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyExternalContentIdentifier: track.downloadURL.absoluteString,
+            MPNowPlayingInfoPropertyServiceIdentifier: "com.pdparchitect.modradio"
+        ]
+        if let artist = track.artist { information[MPMediaItemPropertyArtist] = artist }
+        if let format = track.format { information[MPMediaItemPropertyGenre] = "\(format) tracker music" }
+        if let duration = progress?.duration { information[MPMediaItemPropertyPlaybackDuration] = duration }
+        informationCenter.nowPlayingInfo = information
+
+        switch radio.phase {
+        case .playing: informationCenter.playbackState = .playing
+        case .paused: informationCenter.playbackState = .paused
+        default: informationCenter.playbackState = .stopped
+        }
+    }
+
+    func invalidate() {
+        guard isRegistered else { return }
+        for command in registeredCommands { command.removeTarget(self) }
+        isRegistered = false
+        informationCenter.nowPlayingInfo = nil
+        informationCenter.playbackState = .stopped
+    }
+
+    private var registeredCommands: [MPRemoteCommand] {
+        [commandCenter.playCommand, commandCenter.pauseCommand,
+         commandCenter.togglePlayPauseCommand, commandCenter.stopCommand,
+         commandCenter.nextTrackCommand, commandCenter.previousTrackCommand,
+         commandCenter.skipForwardCommand, commandCenter.skipBackwardCommand,
+         commandCenter.changePlaybackPositionCommand]
+    }
+
+    private func registerCommands() {
+        guard !isRegistered else { return }
+        commandCenter.playCommand.addTarget(self, action: #selector(handlePlay(_:)))
+        commandCenter.pauseCommand.addTarget(self, action: #selector(handlePause(_:)))
+        commandCenter.togglePlayPauseCommand.addTarget(self, action: #selector(handleToggle(_:)))
+        commandCenter.stopCommand.addTarget(self, action: #selector(handleStop(_:)))
+        commandCenter.nextTrackCommand.addTarget(self, action: #selector(handleNext(_:)))
+        commandCenter.previousTrackCommand.addTarget(self, action: #selector(handlePrevious(_:)))
+        commandCenter.skipForwardCommand.preferredIntervals = [15]
+        commandCenter.skipForwardCommand.addTarget(self, action: #selector(handleSkipForward(_:)))
+        commandCenter.skipBackwardCommand.preferredIntervals = [15]
+        commandCenter.skipBackwardCommand.addTarget(self, action: #selector(handleSkipBackward(_:)))
+        commandCenter.changePlaybackPositionCommand.addTarget(
+            self, action: #selector(handlePositionChange(_:)))
+
+        commandCenter.seekForwardCommand.isEnabled = false
+        commandCenter.seekBackwardCommand.isEnabled = false
+        commandCenter.changePlaybackRateCommand.isEnabled = false
+        commandCenter.changeRepeatModeCommand.isEnabled = false
+        commandCenter.changeShuffleModeCommand.isEnabled = false
+        isRegistered = true
+    }
+
+    private func updateCommandAvailability(for radio: RadioController) {
+        let isPlaying = radio.phase == .playing
+        let isPaused = radio.phase == .paused
+        let isActive = isPlaying || isPaused
+        let canSeek = isActive && (radio.playbackProgress?.canSeek == true)
+        commandCenter.playCommand.isEnabled = !isPlaying && radio.phase != .loading
+        commandCenter.pauseCommand.isEnabled = isPlaying
+        commandCenter.togglePlayPauseCommand.isEnabled = radio.phase != .loading
+        commandCenter.stopCommand.isEnabled = isActive || radio.phase == .loading
+        commandCenter.nextTrackCommand.isEnabled = isActive || radio.phase == .loading
+        commandCenter.previousTrackCommand.isEnabled = canSeek
+        commandCenter.skipForwardCommand.isEnabled = canSeek
+        commandCenter.skipBackwardCommand.isEnabled = canSeek
+        commandCenter.changePlaybackPositionCommand.isEnabled = canSeek
+    }
+
+    private func actionableRadio() -> RadioController? {
+        guard let radio else { return nil }
+        return radio
+    }
+
+    @objc private func handlePlay(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+        guard let radio = actionableRadio() else { return .noActionableNowPlayingItem }
+        switch radio.phase {
+        case .paused: radio.togglePause()
+        case .stopped, .failed: radio.playAnother()
+        case .playing: break
+        case .loading: return .commandFailed
+        }
+        update()
+        return .success
+    }
+
+    @objc private func handlePause(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+        guard let radio = actionableRadio(), radio.phase == .playing else {
+            return .noActionableNowPlayingItem
+        }
+        radio.togglePause()
+        update()
+        return .success
+    }
+
+    @objc private func handleToggle(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+        guard let radio = actionableRadio() else { return .noActionableNowPlayingItem }
+        switch radio.phase {
+        case .playing, .paused: radio.togglePause()
+        case .stopped, .failed: radio.playAnother()
+        case .loading: return .commandFailed
+        }
+        update()
+        return .success
+    }
+
+    @objc private func handleStop(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+        guard let radio = actionableRadio() else { return .noActionableNowPlayingItem }
+        radio.stop()
+        update()
+        return .success
+    }
+
+    @objc private func handleNext(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+        guard let radio = actionableRadio() else { return .noActionableNowPlayingItem }
+        radio.playAnother()
+        update()
+        return .success
+    }
+
+    @objc private func handlePrevious(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+        guard let radio = actionableRadio(), radio.playbackProgress?.canSeek == true else {
+            return .noSuchContent
+        }
+        radio.seek(to: 0, precise: true)
+        update()
+        return .success
+    }
+
+    @objc private func handleSkipForward(_ event: MPSkipIntervalCommandEvent) -> MPRemoteCommandHandlerStatus {
+        seek(by: event.interval)
+    }
+
+    @objc private func handleSkipBackward(_ event: MPSkipIntervalCommandEvent) -> MPRemoteCommandHandlerStatus {
+        seek(by: -event.interval)
+    }
+
+    @objc private func handlePositionChange(_ event: MPChangePlaybackPositionCommandEvent) -> MPRemoteCommandHandlerStatus {
+        guard let radio = actionableRadio(), let progress = radio.playbackProgress,
+              progress.canSeek else { return .noSuchContent }
+        let target = min(max(0, event.positionTime), progress.duration ?? event.positionTime)
+        radio.seek(to: target)
+        update()
+        return .success
+    }
+
+    private func seek(by interval: TimeInterval) -> MPRemoteCommandHandlerStatus {
+        guard let radio = actionableRadio(), let progress = radio.playbackProgress,
+              progress.canSeek else { return .noSuchContent }
+        let target = min(max(0, progress.elapsed + interval), progress.duration ?? .greatestFiniteMagnitude)
+        radio.seek(to: target)
+        update()
+        return .success
+    }
+}
+
 // MARK: - Menu bar application
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -1315,6 +1524,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let bassoonItem = NSMenuItem(title: "Open in BassoonTracker", action: #selector(openInBassoon), keyEquivalent: "")
     private let informationItem = NSMenuItem(title: "View Module Page", action: #selector(openInformation), keyEquivalent: "")
     private var progressTimer: Timer?
+    private var systemMedia: SystemMediaController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1336,6 +1546,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(withTitle: "About ModRadio", action: #selector(showAbout), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Quit MOD Radio", action: #selector(quit), keyEquivalent: "q").target = self
 
+        systemMedia = SystemMediaController(radio: radio)
         radio.onChange = { [weak self] in self?.refresh() }
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.updateProgress()
@@ -1347,6 +1558,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func applicationWillTerminate(_ notification: Notification) {
         progressTimer?.invalidate()
+        systemMedia?.invalidate()
+        systemMedia = nil
         radio.stop()
     }
 
@@ -1394,6 +1607,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         bassoonItem.isEnabled = track != nil
         informationItem.isEnabled = track?.informationURL != nil
         updateProgress()
+        systemMedia?.update()
     }
 
     private func trackDetails(prefix: String, track: RadioTrack?) -> String {
@@ -1535,6 +1749,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func progressChanged(_ sender: NSSlider) {
         radio.seek(to: sender.doubleValue)
         updateProgress()
+        systemMedia?.update()
     }
 
     @objc private func openInBassoon() {
@@ -1655,6 +1870,81 @@ private func runRadioTransitionSmokeTest() -> Never {
     }
 }
 
+private func runMediaIntegrationSmokeTest() -> Never {
+    let radio = RadioController()
+    let systemMedia = SystemMediaController(radio: radio)
+    radio.onChange = { systemMedia.update() }
+    let testTrack = RadioTrack(
+        title: "ModRadio Media Test",
+        artist: "ModRadio",
+        format: "MOD",
+        downloadURL: URL(string: "https://www.stef.be/bassoontracker/")!,
+        informationURL: nil
+    )
+    guard let module = try? TrackerModule(data: syntheticMODData()) else {
+        radio.stop()
+        systemMedia.invalidate()
+        FileHandle.standardError.write(Data("modradio: synthetic media test module was invalid\n".utf8))
+        exit(1)
+    }
+    radio.playForVerification(track: testTrack, module: module)
+
+    guard radio.phase == .playing, let track = radio.track else {
+        radio.stop()
+        systemMedia.invalidate()
+        FileHandle.standardError.write(Data("modradio: media integration test failed to start playback\n".utf8))
+        exit(1)
+    }
+
+    systemMedia.update()
+    let informationCenter = MPNowPlayingInfoCenter.default()
+    let commandCenter = MPRemoteCommandCenter.shared()
+    let information = informationCenter.nowPlayingInfo ?? [:]
+    let title = information[MPMediaItemPropertyTitle] as? String
+    let duration = information[MPMediaItemPropertyPlaybackDuration] as? Double
+    let elapsed = information[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double
+    guard title == track.displayTitle,
+          duration != nil,
+          elapsed != nil,
+          informationCenter.playbackState == .playing,
+          commandCenter.pauseCommand.isEnabled,
+          commandCenter.togglePlayPauseCommand.isEnabled,
+          commandCenter.nextTrackCommand.isEnabled else {
+        radio.stop()
+        systemMedia.invalidate()
+        FileHandle.standardError.write(Data("modradio: media integration metadata was incomplete\n".utf8))
+        exit(1)
+    }
+
+    radio.togglePause()
+    systemMedia.update()
+    guard informationCenter.playbackState == .paused,
+          commandCenter.playCommand.isEnabled else {
+        radio.stop()
+        systemMedia.invalidate()
+        FileHandle.standardError.write(Data("modradio: media integration pause state failed\n".utf8))
+        exit(1)
+    }
+
+    radio.stop()
+    systemMedia.invalidate()
+    print("now_playing_title=\(title ?? "")")
+    print("duration_seconds=\(Int(duration ?? 0))")
+    print("media_commands=enabled")
+    print("playback_state=playing_and_paused")
+    exit(0)
+}
+
+private func syntheticMODData() -> Data {
+    var bytes = [UInt8](repeating: 0, count: 1084 + 64 * 4 * 4)
+    let title = Array("ModRadio Media Test".utf8.prefix(20))
+    bytes.replaceSubrange(0..<title.count, with: title)
+    bytes[950] = 1
+    bytes[951] = 0
+    bytes.replaceSubrange(1080..<1084, with: Array("M.K.".utf8))
+    return Data(bytes)
+}
+
 private func runStandardInputPlaybackCheck() -> Never {
     do {
         let data = FileHandle.standardInput.readDataToEndOfFile()
@@ -1678,6 +1968,7 @@ struct ModRadioApplication {
     @MainActor
     static func main() {
         if CommandLine.arguments.contains("--smoke-stdin") { runStandardInputPlaybackCheck() }
+        if CommandLine.arguments.contains("--smoke-media") { runMediaIntegrationSmokeTest() }
         if CommandLine.arguments.contains("--smoke-transition") { runRadioTransitionSmokeTest() }
         if CommandLine.arguments.contains("--smoke-mod") { runSmokeTest(format: .mod) }
         if CommandLine.arguments.contains("--smoke-xm") { runSmokeTest(format: .xm) }
