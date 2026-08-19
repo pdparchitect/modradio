@@ -89,6 +89,7 @@ private enum TrackerPlaybackError: Error, LocalizedError {
     case decoderUnavailable
     case audioSetupFailed
     case timelineUnavailable
+    case transitionUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -96,6 +97,7 @@ private enum TrackerPlaybackError: Error, LocalizedError {
         case .decoderUnavailable: return "The tracker replay engine could not start."
         case .audioSetupFailed: return "The Mac audio engine could not start."
         case .timelineUnavailable: return "The track timeline could not be read or seeked."
+        case .transitionUnavailable: return "The prefetched track did not start after completion."
         }
     }
 }
@@ -994,6 +996,11 @@ private enum RadioPhase: Equatable {
     case failed(String)
 }
 
+private struct PreparedTrack {
+    let track: RadioTrack
+    let module: TrackerModule
+}
+
 private final class RadioController {
     private static let volumeDefaultsKey = "playbackVolume"
 
@@ -1003,8 +1010,13 @@ private final class RadioController {
     private let audioPlayer = UniversalTrackerAudioPlayer()
     private let session: URLSession
     private var task: URLSessionDataTask?
+    private var prefetchTask: URLSessionDataTask?
+    private var prefetchedTrack: PreparedTrack?
+    private var playbackGeneration = UUID()
+    private var waitingForPrefetch = false
     private var stationIsOn = false
     private var unsupportedSkips = 0
+    private var prefetchFailures = 0
     private var nextFormat = CatalogueFormat.random
 
     init() {
@@ -1021,22 +1033,28 @@ private final class RadioController {
 
     var playbackProgress: PlaybackProgress? { audioPlayer.progress() }
 
+    var hasPrefetchedTrack: Bool { prefetchedTrack != nil }
+
     func setVolume(_ value: Float) {
         audioPlayer.setVolume(value)
         UserDefaults.standard.set(Double(audioPlayer.volume), forKey: Self.volumeDefaultsKey)
     }
 
-    func seek(to seconds: TimeInterval) { audioPlayer.seek(to: seconds) }
+    func seek(to seconds: TimeInterval, precise: Bool = false) {
+        audioPlayer.seek(to: seconds, precise: precise)
+    }
 
     func playRandom() {
         stationIsOn = true
         unsupportedSkips = 0
-        loadRandomTrack()
+        beginNewGeneration(with: nil)
     }
 
     func playAnother() {
         stationIsOn = true
-        loadRandomTrack()
+        unsupportedSkips = 0
+        let prepared = prefetchedTrack
+        beginNewGeneration(with: prepared)
     }
 
     func togglePause() {
@@ -1058,13 +1076,41 @@ private final class RadioController {
 
     func stop() {
         stationIsOn = false
+        playbackGeneration = UUID()
         task?.cancel()
+        prefetchTask?.cancel()
         task = nil
+        prefetchTask = nil
+        prefetchedTrack = nil
+        waitingForPrefetch = false
         audioPlayer.stop()
         phase = .stopped
     }
 
-    private func loadRandomTrack() {
+    private func beginNewGeneration(with prepared: PreparedTrack?) {
+        playbackGeneration = UUID()
+        let generation = playbackGeneration
+        task?.cancel()
+        prefetchTask?.cancel()
+        task = nil
+        prefetchTask = nil
+        prefetchedTrack = nil
+        waitingForPrefetch = false
+        prefetchFailures = 0
+        audioPlayer.stop()
+        if let prepared {
+            startPlayback(prepared, generation: generation)
+        } else {
+            loadRandomTrack(generation: generation)
+        }
+    }
+
+    private func isCurrent(_ generation: UUID) -> Bool {
+        stationIsOn && playbackGeneration == generation
+    }
+
+    private func loadRandomTrack(generation: UUID) {
+        guard isCurrent(generation) else { return }
         task?.cancel()
         audioPlayer.stop()
         phase = .loading
@@ -1075,58 +1121,61 @@ private final class RadioController {
             guard let self else { return }
             if let error = error as? URLError, error.code == .cancelled { return }
             guard error == nil, let data else {
-                DispatchQueue.main.async { self.phase = .failed("Couldn’t reach BassoonTracker.") }
+                DispatchQueue.main.async {
+                    guard self.isCurrent(generation) else { return }
+                    self.task = nil
+                    self.phase = .failed("Couldn’t reach BassoonTracker.")
+                }
                 return
             }
 
             do {
                 let track = try BassoonCatalogue.parseRandomTrack(from: data)
-                self.download(track)
+                DispatchQueue.main.async {
+                    guard self.isCurrent(generation) else { return }
+                    self.download(track, generation: generation)
+                }
             } catch {
-                DispatchQueue.main.async { self.phase = .failed(error.localizedDescription) }
+                DispatchQueue.main.async {
+                    guard self.isCurrent(generation) else { return }
+                    self.task = nil
+                    self.phase = .failed(error.localizedDescription)
+                }
             }
         }
         task?.resume()
     }
 
-    private func download(_ track: RadioTrack) {
+    private func download(_ track: RadioTrack, generation: UUID) {
+        guard isCurrent(generation) else { return }
         task = session.dataTask(with: track.downloadURL) { [weak self] data, _, error in
             guard let self else { return }
             if let error = error as? URLError, error.code == .cancelled { return }
             guard error == nil, let data else {
-                DispatchQueue.main.async { self.phase = .failed("The MOD could not be downloaded.") }
+                DispatchQueue.main.async {
+                    guard self.isCurrent(generation) else { return }
+                    self.task = nil
+                    self.phase = .failed("The tracker module could not be downloaded.")
+                }
                 return
             }
 
             do {
                 let module = try TrackerModule(data: data)
                 DispatchQueue.main.async {
-                    guard self.stationIsOn else { return }
-                    self.track = RadioTrack(
-                        title: module.title.isEmpty ? track.displayTitle : module.title,
-                        artist: track.artist,
-                        format: module.format,
-                        downloadURL: track.downloadURL,
-                        informationURL: track.informationURL
-                    )
-                    do {
-                        try self.audioPlayer.play(module) { [weak self] in
-                            guard let self, self.stationIsOn else { return }
-                            self.loadRandomTrack()
-                        }
-                        self.unsupportedSkips = 0
-                        self.phase = .playing
-                    } catch {
-                        self.phase = .failed("The Mac audio engine could not start.")
-                    }
+                    guard self.isCurrent(generation) else { return }
+                    self.task = nil
+                    self.startPlayback(PreparedTrack(track: track, module: module),
+                                       generation: generation)
                 }
             } catch {
                 DispatchQueue.main.async {
-                    guard self.stationIsOn else { return }
+                    guard self.isCurrent(generation) else { return }
+                    self.task = nil
                     if self.unsupportedSkips < 3 {
                         self.unsupportedSkips += 1
                         self.phase = .loading
-                        self.loadRandomTrack()
+                        self.loadRandomTrack(generation: generation)
                     } else {
                         self.phase = .failed(error.localizedDescription)
                     }
@@ -1134,6 +1183,114 @@ private final class RadioController {
             }
         }
         task?.resume()
+    }
+
+    private func startPlayback(_ prepared: PreparedTrack, generation: UUID) {
+        guard isCurrent(generation) else { return }
+        waitingForPrefetch = false
+        track = RadioTrack(
+            title: prepared.module.title.isEmpty ? prepared.track.displayTitle : prepared.module.title,
+            artist: prepared.track.artist,
+            format: prepared.module.format,
+            downloadURL: prepared.track.downloadURL,
+            informationURL: prepared.track.informationURL
+        )
+        do {
+            try audioPlayer.play(prepared.module) { [weak self] in
+                guard let self else { return }
+                self.advanceAfterFinish(generation: generation)
+            }
+            unsupportedSkips = 0
+            prefetchFailures = 0
+            phase = .playing
+            prefetchNextTrack(generation: generation)
+        } catch {
+            phase = .failed("The Mac audio engine could not start.")
+        }
+    }
+
+    private func advanceAfterFinish(generation: UUID) {
+        guard isCurrent(generation) else { return }
+        if let prepared = prefetchedTrack {
+            prefetchedTrack = nil
+            startPlayback(prepared, generation: generation)
+        } else if prefetchTask != nil {
+            waitingForPrefetch = true
+            audioPlayer.stop()
+            phase = .loading
+        } else {
+            loadRandomTrack(generation: generation)
+        }
+    }
+
+    private func prefetchNextTrack(generation: UUID) {
+        guard isCurrent(generation) else { return }
+        prefetchTask?.cancel()
+        prefetchedTrack = nil
+
+        let requestedFormat = nextFormat
+        nextFormat = requestedFormat == .mod ? .xm : .mod
+        let catalogueTask = session.dataTask(with: requestedFormat.endpoint) { [weak self] data, _, error in
+            guard let self else { return }
+            if let error = error as? URLError, error.code == .cancelled { return }
+            guard error == nil, let data else {
+                DispatchQueue.main.async { self.prefetchFailed(generation: generation) }
+                return
+            }
+            do {
+                let track = try BassoonCatalogue.parseRandomTrack(from: data)
+                DispatchQueue.main.async {
+                    guard self.isCurrent(generation) else { return }
+                    self.downloadPrefetched(track, generation: generation)
+                }
+            } catch {
+                DispatchQueue.main.async { self.prefetchFailed(generation: generation) }
+            }
+        }
+        prefetchTask = catalogueTask
+        catalogueTask.resume()
+    }
+
+    private func downloadPrefetched(_ track: RadioTrack, generation: UUID) {
+        guard isCurrent(generation) else { return }
+        let downloadTask = session.dataTask(with: track.downloadURL) { [weak self] data, _, error in
+            guard let self else { return }
+            if let error = error as? URLError, error.code == .cancelled { return }
+            guard error == nil, let data else {
+                DispatchQueue.main.async { self.prefetchFailed(generation: generation) }
+                return
+            }
+            do {
+                let module = try TrackerModule(data: data)
+                let prepared = PreparedTrack(track: track, module: module)
+                DispatchQueue.main.async {
+                    guard self.isCurrent(generation) else { return }
+                    self.prefetchTask = nil
+                    self.prefetchFailures = 0
+                    if self.waitingForPrefetch {
+                        self.startPlayback(prepared, generation: generation)
+                    } else {
+                        self.prefetchedTrack = prepared
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { self.prefetchFailed(generation: generation) }
+            }
+        }
+        prefetchTask = downloadTask
+        downloadTask.resume()
+    }
+
+    private func prefetchFailed(generation: UUID) {
+        guard isCurrent(generation) else { return }
+        prefetchTask = nil
+        if prefetchFailures < 3 {
+            prefetchFailures += 1
+            prefetchNextTrack(generation: generation)
+        } else if waitingForPrefetch {
+            waitingForPrefetch = false
+            loadRandomTrack(generation: generation)
+        }
     }
 }
 
@@ -1457,6 +1614,47 @@ private func runSmokeTest(format: CatalogueFormat = .random) -> Never {
     }
 }
 
+private func waitForRadio(timeout: TimeInterval, condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        RunLoop.current.run(until: min(deadline, Date().addingTimeInterval(0.1)))
+    }
+    return condition()
+}
+
+private func runRadioTransitionSmokeTest() -> Never {
+    let radio = RadioController()
+    do {
+        radio.playRandom()
+        guard waitForRadio(timeout: 25, condition: {
+            radio.phase == .playing && radio.hasPrefetchedTrack
+        }), let firstTrack = radio.track,
+            let duration = radio.playbackProgress?.duration,
+            duration > 2 else {
+            throw TrackerPlaybackError.transitionUnavailable
+        }
+
+        radio.seek(to: max(0, duration - 0.5), precise: true)
+        guard waitForRadio(timeout: 8, condition: {
+            radio.phase == .playing && radio.track?.downloadURL != firstTrack.downloadURL
+        }), let nextTrack = radio.track else {
+            throw TrackerPlaybackError.transitionUnavailable
+        }
+
+        radio.stop()
+        print("first_track=\(firstTrack.displayTitle)")
+        print("next_track=\(nextTrack.displayTitle)")
+        print("prefetch=ready")
+        print("transition=completed")
+        exit(0)
+    } catch {
+        radio.stop()
+        FileHandle.standardError.write(Data(("modradio: transition test failed: \(error.localizedDescription)\n").utf8))
+        exit(1)
+    }
+}
+
 private func runStandardInputPlaybackCheck() -> Never {
     do {
         let data = FileHandle.standardInput.readDataToEndOfFile()
@@ -1480,6 +1678,7 @@ struct ModRadioApplication {
     @MainActor
     static func main() {
         if CommandLine.arguments.contains("--smoke-stdin") { runStandardInputPlaybackCheck() }
+        if CommandLine.arguments.contains("--smoke-transition") { runRadioTransitionSmokeTest() }
         if CommandLine.arguments.contains("--smoke-mod") { runSmokeTest(format: .mod) }
         if CommandLine.arguments.contains("--smoke-xm") { runSmokeTest(format: .xm) }
         if CommandLine.arguments.contains("--smoke-test") { runSmokeTest() }

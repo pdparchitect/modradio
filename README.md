@@ -16,6 +16,7 @@ always-available random tracker station useful and enjoyable?
 - Random MOD and XM discovery through BassoonTracker and The Mod Archive
 - Continuous play, pause, resume, skip, stop, and persistent in-menu volume control
 - Live elapsed and estimated total time with seeking for libxmp-backed tracks
+- In-memory background prefetching for near-immediate transitions and skips
 - Song title and available artist attribution
 - Links to the current song in BassoonTracker and The Mod Archive
 - Bundled libxmp-lite replay engine with no external runtime installation
@@ -35,6 +36,11 @@ Most catalogue tracks expose an estimated duration through libxmp and can be
 seeked directly from the menu. Rare legacy MOD files handled by the native
 fallback show elapsed time only because their final duration cannot be known
 reliably without replaying the song.
+
+While one track plays, the next alternating MOD or XM is downloaded, validated,
+and held in memory. Natural completion and **Play Another Track** consume that
+ready slot immediately, then refill it in the background. No module data is
+written outside the app's process.
 
 ## Build
 
