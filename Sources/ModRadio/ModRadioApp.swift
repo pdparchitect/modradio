@@ -1,0 +1,1234 @@
+import AppKit
+import AudioToolbox
+import AVFoundation
+import CLibXMP
+import Foundation
+
+// MARK: - Remote catalogue
+
+private struct RadioTrack {
+    let title: String
+    let artist: String?
+    let format: String?
+    let downloadURL: URL
+    let informationURL: URL?
+
+    var displayTitle: String {
+        let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? downloadURL.lastPathComponent : value
+    }
+}
+
+private enum CatalogueFormat: String {
+    case mod = "MOD"
+    case xm = "XM"
+
+    var endpoint: URL {
+        switch self {
+        case .mod: return URL(string: "https://www.stef.be/bassoontracker/api/random")!
+        case .xm: return URL(string: "https://www.stef.be/bassoontracker/api/randomxm")!
+        }
+    }
+
+    static var random: CatalogueFormat { Bool.random() ? .mod : .xm }
+}
+
+private enum CatalogueError: Error, LocalizedError {
+    case invalidResponse
+    case missingTrack
+    case invalidDownloadURL
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidResponse: return "BassoonTracker returned an unreadable response."
+        case .missingTrack: return "BassoonTracker did not return a random MOD."
+        case .invalidDownloadURL: return "The random MOD did not include a valid download URL."
+        }
+    }
+}
+
+private enum BassoonCatalogue {
+    static func parseRandomTrack(from data: Data) throws -> RadioTrack {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let archive = root["modarchive"] as? [String: Any],
+              let module = archive["module"] as? [String: Any] else {
+            throw CatalogueError.invalidResponse
+        }
+
+        guard !module.isEmpty else { throw CatalogueError.missingTrack }
+        let rawURL = module["url"] as? String ?? ""
+        guard let downloadURL = URL(string: rawURL),
+              ["http", "https"].contains(downloadURL.scheme?.lowercased() ?? "") else {
+            throw CatalogueError.invalidDownloadURL
+        }
+
+        let title = (module["songtitle"] as? String)
+            ?? (module["filename"] as? String)
+            ?? downloadURL.lastPathComponent
+        let format = (module["format"] as? String)?.uppercased()
+        let infoURL = (module["infopage"] as? String).flatMap(URL.init(string:))
+        var artist: String?
+        if let artistInfo = module["artist_info"] as? [String: Any] {
+            if let guessed = artistInfo["guessed_artist"] as? [String: Any] {
+                artist = guessed["alias"] as? String
+            } else if let known = artistInfo["artist"] as? [String: Any] {
+                artist = known["alias"] as? String
+            }
+        }
+        if artist?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true { artist = nil }
+
+        return RadioTrack(title: title, artist: artist, format: format, downloadURL: downloadURL,
+                          informationURL: infoURL)
+    }
+}
+
+// MARK: - Tracker module inspection
+
+private enum TrackerPlaybackError: Error, LocalizedError {
+    case unsupportedModule
+    case decoderUnavailable
+    case audioSetupFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedModule: return "This tracker file could not be decoded."
+        case .decoderUnavailable: return "The tracker replay engine could not start."
+        case .audioSetupFailed: return "The Mac audio engine could not start."
+        }
+    }
+}
+
+private struct TrackerModule {
+    let data: Data
+    let title: String
+    let format: String
+    fileprivate let fallbackMOD: MODModule?
+
+    init(data: Data) throws {
+        var information = xmp_test_info()
+        let result = data.withUnsafeBytes { bytes -> Int32 in
+            guard let baseAddress = bytes.baseAddress else { return -1 }
+            return xmp_test_module_from_memory(baseAddress, data.count, &information)
+        }
+        guard result == 0 else {
+            guard let module = try? MODParser.parse(data) else {
+                throw TrackerPlaybackError.unsupportedModule
+            }
+            self.data = data
+            title = module.title
+            format = "MOD"
+            fallbackMOD = module
+            return
+        }
+
+        var nameBytes = information.name
+        var typeBytes = information.type
+        let detectedTitle = Self.string(from: &nameBytes)
+        let detectedType = Self.string(from: &typeBytes)
+        self.data = data
+        title = detectedTitle
+        format = Self.shortFormat(for: detectedType, data: data)
+        fallbackMOD = nil
+    }
+
+    private static func string<T>(from value: inout T) -> String {
+        withUnsafePointer(to: &value) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: MemoryLayout<T>.size) {
+                String(cString: $0).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+    }
+
+    private static func shortFormat(for type: String, data: Data) -> String {
+        let normalized = type.lowercased()
+        if normalized.contains("fast") || normalized.contains("xm") ||
+            data.starts(with: Data("Extended Module: ".utf8)) { return "XM" }
+        if normalized.contains("protracker") || normalized.contains("mod") { return "MOD" }
+        if normalized.contains("scream") || normalized.contains("s3m") { return "S3M" }
+        if normalized.contains("impulse") || normalized.contains("it") { return "IT" }
+        return type.isEmpty ? "Tracker" : type
+    }
+}
+
+// MARK: - ProTracker MOD model
+
+private struct MODSample {
+    let name: String
+    let pcm: [Float]
+    let volume: Float
+    let fineTune: Int
+    let loopStart: Int
+    let loopLength: Int
+
+    var hasLoop: Bool {
+        loopLength > 2 && loopStart >= 0 && loopStart + loopLength <= pcm.count
+    }
+}
+
+private struct MODNote {
+    let sampleNumber: Int
+    let period: Int
+    let effect: Int
+    let parameter: UInt8
+}
+
+private struct MODPattern {
+    let events: [MODNote]
+}
+
+private struct MODModule {
+    let title: String
+    let channelCount: Int
+    let orders: [Int]
+    let patterns: [MODPattern]
+    let samples: [MODSample]
+}
+
+private enum MODParseError: Error, LocalizedError {
+    case truncated
+    case unsupportedSignature(String)
+    case invalidSong
+
+    var errorDescription: String? {
+        switch self {
+        case .truncated: return "The module file is incomplete."
+        case .unsupportedSignature(let signature):
+            return "This first version does not yet support MOD signature \(signature)."
+        case .invalidSong: return "The module does not contain a playable song."
+        }
+    }
+}
+
+private enum MODParser {
+    static func parse(_ data: Data) throws -> MODModule {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 1084 else { throw MODParseError.truncated }
+
+        let title = text(bytes, offset: 0, count: 20)
+        let signature = text(bytes, offset: 1080, count: 4)
+        guard let channelCount = channels(for: signature), channelCount > 0, channelCount <= 32 else {
+            throw MODParseError.unsupportedSignature(signature.isEmpty ? "unknown" : signature)
+        }
+
+        struct Header {
+            let name: String
+            let length: Int
+            let fineTune: Int
+            let volume: Float
+            let loopStart: Int
+            let loopLength: Int
+        }
+
+        var headers: [Header] = []
+        for index in 0..<31 {
+            let offset = 20 + index * 30
+            guard offset + 30 <= bytes.count else { throw MODParseError.truncated }
+            let rawFineTune = Int(bytes[offset + 24] & 0x0F)
+            let signedFineTune = rawFineTune > 7 ? rawFineTune - 16 : rawFineTune
+            headers.append(Header(
+                name: text(bytes, offset: offset, count: 22),
+                length: word(bytes, offset + 22) * 2,
+                fineTune: signedFineTune,
+                volume: Float(min(bytes[offset + 25], 64)) / 64,
+                loopStart: word(bytes, offset + 26) * 2,
+                loopLength: word(bytes, offset + 28) * 2
+            ))
+        }
+
+        let songLength = Int(bytes[950])
+        guard songLength > 0 && songLength <= 128 else { throw MODParseError.invalidSong }
+        let orders = bytes[952..<(952 + songLength)].map(Int.init)
+        guard let highestPattern = orders.max() else { throw MODParseError.invalidSong }
+        let patternCount = highestPattern + 1
+        let patternByteCount = patternCount * 64 * channelCount * 4
+        let sampleDataOffset = 1084 + patternByteCount
+        guard sampleDataOffset <= bytes.count else { throw MODParseError.truncated }
+
+        var patterns: [MODPattern] = []
+        patterns.reserveCapacity(patternCount)
+        for patternIndex in 0..<patternCount {
+            var events: [MODNote] = []
+            events.reserveCapacity(64 * channelCount)
+            var offset = 1084 + patternIndex * 64 * channelCount * 4
+            for _ in 0..<(64 * channelCount) {
+                guard offset + 4 <= bytes.count else { throw MODParseError.truncated }
+                let first = bytes[offset]
+                let second = bytes[offset + 1]
+                let third = bytes[offset + 2]
+                let fourth = bytes[offset + 3]
+                let sampleNumber = Int(first & 0xF0) | Int(third >> 4)
+                let period = (Int(first & 0x0F) << 8) | Int(second)
+                events.append(MODNote(sampleNumber: sampleNumber, period: period,
+                                      effect: Int(third & 0x0F), parameter: fourth))
+                offset += 4
+            }
+            patterns.append(MODPattern(events: events))
+        }
+
+        var samples: [MODSample] = []
+        samples.reserveCapacity(31)
+        var cursor = sampleDataOffset
+        for header in headers {
+            guard cursor + header.length <= bytes.count else { throw MODParseError.truncated }
+            let pcm = bytes[cursor..<(cursor + header.length)].map {
+                Float(Int8(bitPattern: $0)) / 128
+            }
+            samples.append(MODSample(name: header.name, pcm: pcm, volume: header.volume,
+                                     fineTune: header.fineTune, loopStart: header.loopStart,
+                                     loopLength: header.loopLength))
+            cursor += header.length
+        }
+
+        return MODModule(title: title, channelCount: channelCount, orders: orders,
+                         patterns: patterns, samples: samples)
+    }
+
+    private static func word(_ bytes: [UInt8], _ offset: Int) -> Int {
+        (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
+    }
+
+    private static func text(_ bytes: [UInt8], offset: Int, count: Int) -> String {
+        guard offset >= 0 && offset + count <= bytes.count else { return "" }
+        let content = bytes[offset..<(offset + count)].prefix { $0 != 0 }
+        return String(bytes: content, encoding: .isoLatin1)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private static func channels(for signature: String) -> Int? {
+        if ["M.K.", "M!K!", "M&K!", "N.T.", "FLT4", "4CHN"].contains(signature) { return 4 }
+        if signature.hasSuffix("CHN"), let value = Int(signature.dropLast(3)) { return value }
+        if signature.hasSuffix("CH"), let value = Int(signature.dropLast(2)) { return value }
+        return nil
+    }
+}
+
+// MARK: - Minimal native MOD replay engine
+
+private final class MODChannel {
+    var sampleIndex = -1
+    var samplePosition = 0.0
+    var basePeriod = 0.0
+    var currentPeriod = 0.0
+    var targetPeriod = 0.0
+    var volume: Float = 0
+    var active = false
+    var effect = 0
+    var parameter: UInt8 = 0
+    var effectMemory = Array(repeating: UInt8(0), count: 16)
+    var vibratoPhase = 0.0
+    var loopRow = 0
+    var loopCount = 0
+    var delayedNote: MODNote?
+}
+
+private final class MODRenderer: @unchecked Sendable {
+    private let module: MODModule
+    private let sampleRate: Double
+    private let onFinish: () -> Void
+    private let amigaClock = 3_546_895.0
+    private var channels: [MODChannel]
+    private var songPosition = 0
+    private var row = 0
+    private var tick = 0
+    private var speed = 6
+    private var bpm = 125
+    private var framesRemainingInTick = 0
+    private var totalFrames = 0
+    private var pendingPositionJump: Int?
+    private var pendingBreakRow: Int?
+    private var pendingLoopRow: Int?
+    private var positionVisits: [Int]
+    private var ended = false
+    private var finishSent = false
+
+    init(module: MODModule, sampleRate: Double, onFinish: @escaping () -> Void) {
+        self.module = module
+        self.sampleRate = sampleRate
+        self.onFinish = onFinish
+        channels = (0..<module.channelCount).map { _ in MODChannel() }
+        positionVisits = Array(repeating: 0, count: module.orders.count)
+        if !positionVisits.isEmpty { positionVisits[0] = 1 }
+    }
+
+    func render(frameCount: Int, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>) {
+        for frame in 0..<frameCount {
+            if framesRemainingInTick <= 0 && !ended { prepareNextTick() }
+            guard !ended else {
+                left[frame] = 0
+                right[frame] = 0
+                sendFinishOnce()
+                continue
+            }
+
+            var leftMix: Float = 0
+            var rightMix: Float = 0
+            for (index, channel) in channels.enumerated() where channel.active {
+                guard channel.sampleIndex >= 0 && channel.sampleIndex < module.samples.count,
+                      channel.currentPeriod > 0 else { continue }
+                let sample = module.samples[channel.sampleIndex]
+                guard !sample.pcm.isEmpty else { channel.active = false; continue }
+
+                normalizePosition(channel, sample: sample)
+                guard channel.active else { continue }
+                let sampleIndex = Int(channel.samplePosition)
+                guard sampleIndex >= 0 && sampleIndex < sample.pcm.count else {
+                    channel.active = false
+                    continue
+                }
+
+                let value = sample.pcm[sampleIndex] * channel.volume
+                let leftChannel = index % 4 == 0 || index % 4 == 3
+                if leftChannel {
+                    leftMix += value * 0.82
+                    rightMix += value * 0.18
+                } else {
+                    leftMix += value * 0.18
+                    rightMix += value * 0.82
+                }
+
+                let fineTuneRatio = pow(2.0, Double(sample.fineTune) / 96.0)
+                channel.samplePosition += (amigaClock / channel.currentPeriod) * fineTuneRatio / sampleRate
+            }
+
+            let scale = Float(1.15 / sqrt(Double(max(2, module.channelCount))))
+            left[frame] = max(-1, min(1, leftMix * scale))
+            right[frame] = max(-1, min(1, rightMix * scale))
+            framesRemainingInTick -= 1
+            totalFrames += 1
+            if totalFrames >= Int(sampleRate * 60 * 12) { ended = true }
+        }
+    }
+
+    private func normalizePosition(_ channel: MODChannel, sample: MODSample) {
+        guard channel.samplePosition >= Double(sample.pcm.count) else { return }
+        if sample.hasLoop {
+            let end = sample.loopStart + sample.loopLength
+            while channel.samplePosition >= Double(end) {
+                channel.samplePosition -= Double(sample.loopLength)
+            }
+            if channel.samplePosition < Double(sample.loopStart) {
+                channel.samplePosition = Double(sample.loopStart)
+            }
+        } else {
+            channel.active = false
+        }
+    }
+
+    private func prepareNextTick() {
+        if tick >= speed {
+            tick = 0
+            advanceRow()
+            if ended { return }
+        }
+
+        if tick == 0 { processRow() } else { processEffects() }
+        framesRemainingInTick = max(1, Int((sampleRate * 2.5 / Double(max(32, bpm))).rounded()))
+        tick += 1
+    }
+
+    private func processRow() {
+        guard songPosition >= 0 && songPosition < module.orders.count else { ended = true; return }
+        let patternIndex = module.orders[songPosition]
+        guard patternIndex >= 0 && patternIndex < module.patterns.count else { ended = true; return }
+        let pattern = module.patterns[patternIndex]
+        let start = row * module.channelCount
+        guard start + module.channelCount <= pattern.events.count else { ended = true; return }
+
+        pendingPositionJump = nil
+        pendingBreakRow = nil
+        pendingLoopRow = nil
+
+        for index in 0..<module.channelCount {
+            let event = pattern.events[start + index]
+            let channel = channels[index]
+            channel.effect = event.effect
+            if event.parameter != 0 { channel.effectMemory[event.effect] = event.parameter }
+            channel.parameter = event.parameter == 0 ? channel.effectMemory[event.effect] : event.parameter
+            channel.currentPeriod = channel.basePeriod
+            channel.delayedNote = nil
+
+            let extendedCommand = event.effect == 0xE ? Int(event.parameter >> 4) : -1
+            if extendedCommand == 0xD {
+                channel.delayedNote = event
+                if event.sampleNumber > 0 { selectSample(event.sampleNumber, for: channel) }
+            } else {
+                applyNote(event, to: channel)
+            }
+
+            switch event.effect {
+            case 0x9:
+                if event.period > 0 || event.sampleNumber > 0 {
+                    channel.samplePosition = Double(Int(channel.parameter) * 256)
+                }
+            case 0xB:
+                pendingPositionJump = Int(event.parameter)
+            case 0xC:
+                channel.volume = Float(min(event.parameter, 64)) / 64
+            case 0xD:
+                pendingBreakRow = min(63, Int(event.parameter >> 4) * 10 + Int(event.parameter & 0x0F))
+            case 0xE:
+                processExtendedAtRow(event.parameter, channel: channel)
+            case 0xF:
+                let value = Int(event.parameter)
+                if value == 0 { ended = true }
+                else if value < 32 { speed = max(1, value) }
+                else { bpm = value }
+            default:
+                break
+            }
+        }
+    }
+
+    private func selectSample(_ sampleNumber: Int, for channel: MODChannel) {
+        let index = sampleNumber - 1
+        guard index >= 0 && index < module.samples.count else { return }
+        channel.sampleIndex = index
+        channel.volume = module.samples[index].volume
+    }
+
+    private func applyNote(_ note: MODNote, to channel: MODChannel) {
+        if note.sampleNumber > 0 { selectSample(note.sampleNumber, for: channel) }
+        guard note.period > 0 else { return }
+        if note.effect == 0x3 || note.effect == 0x5 {
+            channel.targetPeriod = Double(note.period)
+            if channel.basePeriod <= 0 { trigger(note, on: channel) }
+        } else {
+            trigger(note, on: channel)
+        }
+    }
+
+    private func trigger(_ note: MODNote, on channel: MODChannel) {
+        guard note.period > 0 else { return }
+        channel.basePeriod = Double(note.period)
+        channel.currentPeriod = Double(note.period)
+        channel.samplePosition = 0
+        channel.active = channel.sampleIndex >= 0
+    }
+
+    private func processExtendedAtRow(_ parameter: UInt8, channel: MODChannel) {
+        let command = Int(parameter >> 4)
+        let value = Int(parameter & 0x0F)
+        switch command {
+        case 0x1:
+            channel.basePeriod = max(56, channel.basePeriod - Double(value))
+            channel.currentPeriod = channel.basePeriod
+        case 0x2:
+            channel.basePeriod = min(1712, channel.basePeriod + Double(value))
+            channel.currentPeriod = channel.basePeriod
+        case 0x6:
+            if value == 0 {
+                channel.loopRow = row
+            } else if channel.loopCount == 0 {
+                channel.loopCount = value
+                pendingLoopRow = channel.loopRow
+            } else {
+                channel.loopCount -= 1
+                if channel.loopCount > 0 { pendingLoopRow = channel.loopRow }
+            }
+        case 0xA:
+            channel.volume = min(1, channel.volume + Float(value) / 64)
+        case 0xB:
+            channel.volume = max(0, channel.volume - Float(value) / 64)
+        default:
+            break
+        }
+    }
+
+    private func processEffects() {
+        for channel in channels {
+            channel.currentPeriod = channel.basePeriod
+            let parameter = channel.parameter
+            switch channel.effect {
+            case 0x0:
+                let phase = tick % 3
+                let semitones = phase == 1 ? Int(parameter >> 4) : phase == 2 ? Int(parameter & 0x0F) : 0
+                if semitones > 0 && channel.basePeriod > 0 {
+                    channel.currentPeriod = channel.basePeriod / pow(2, Double(semitones) / 12)
+                }
+            case 0x1:
+                channel.basePeriod = max(56, channel.basePeriod - Double(parameter))
+                channel.currentPeriod = channel.basePeriod
+            case 0x2:
+                channel.basePeriod = min(1712, channel.basePeriod + Double(parameter))
+                channel.currentPeriod = channel.basePeriod
+            case 0x3:
+                tonePortamento(channel, amount: Int(parameter))
+            case 0x4:
+                vibrato(channel, parameter: parameter)
+            case 0x5:
+                tonePortamento(channel, amount: Int(channel.effectMemory[0x3]))
+                volumeSlide(channel, parameter: parameter)
+            case 0x6:
+                vibrato(channel, parameter: channel.effectMemory[0x4])
+                volumeSlide(channel, parameter: parameter)
+            case 0xA:
+                volumeSlide(channel, parameter: parameter)
+            case 0xE:
+                processExtendedAtTick(parameter, channel: channel)
+            default:
+                break
+            }
+        }
+    }
+
+    private func tonePortamento(_ channel: MODChannel, amount: Int) {
+        let step = Double(amount)
+        guard step > 0 && channel.targetPeriod > 0 else { return }
+        if channel.basePeriod < channel.targetPeriod {
+            channel.basePeriod = min(channel.targetPeriod, channel.basePeriod + step)
+        } else if channel.basePeriod > channel.targetPeriod {
+            channel.basePeriod = max(channel.targetPeriod, channel.basePeriod - step)
+        }
+        channel.currentPeriod = channel.basePeriod
+    }
+
+    private func vibrato(_ channel: MODChannel, parameter: UInt8) {
+        let speed = Double(parameter >> 4)
+        let depth = Double(parameter & 0x0F)
+        channel.vibratoPhase += speed * .pi / 32
+        channel.currentPeriod = max(56, channel.basePeriod + sin(channel.vibratoPhase) * depth * 2)
+    }
+
+    private func volumeSlide(_ channel: MODChannel, parameter: UInt8) {
+        let up = Float(parameter >> 4) / 64
+        let down = Float(parameter & 0x0F) / 64
+        channel.volume = max(0, min(1, channel.volume + up - down))
+    }
+
+    private func processExtendedAtTick(_ parameter: UInt8, channel: MODChannel) {
+        let command = Int(parameter >> 4)
+        let value = Int(parameter & 0x0F)
+        switch command {
+        case 0x9 where value > 0 && tick % value == 0:
+            channel.samplePosition = 0
+            channel.active = channel.sampleIndex >= 0
+        case 0xC where tick == value:
+            channel.volume = 0
+        case 0xD where tick == value:
+            if let delayed = channel.delayedNote { trigger(delayed, on: channel) }
+        default:
+            break
+        }
+    }
+
+    private func advanceRow() {
+        if let loopRow = pendingLoopRow {
+            row = max(0, min(63, loopRow))
+            return
+        }
+
+        if pendingPositionJump != nil || pendingBreakRow != nil {
+            songPosition = pendingPositionJump ?? (songPosition + 1)
+            row = pendingBreakRow ?? 0
+        } else {
+            row += 1
+            if row >= 64 {
+                row = 0
+                songPosition += 1
+            }
+        }
+
+        guard songPosition >= 0 && songPosition < module.orders.count else { ended = true; return }
+        if row == 0 || pendingPositionJump != nil || pendingBreakRow != nil {
+            positionVisits[songPosition] += 1
+            if positionVisits[songPosition] > 2 { ended = true }
+        }
+    }
+
+    private func sendFinishOnce() {
+        guard !finishSent else { return }
+        finishSent = true
+        DispatchQueue.main.async { [onFinish] in onFinish() }
+    }
+}
+
+private final class MODAudioPlayer {
+    private let engine = AVAudioEngine()
+    private var sourceNode: AVAudioSourceNode?
+    private var renderer: MODRenderer?
+    private var playbackToken = UUID()
+    private(set) var isPaused = false
+
+    func play(_ module: MODModule, onFinish: @escaping () -> Void) throws {
+        stop()
+        let token = UUID()
+        playbackToken = token
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let renderer = MODRenderer(module: module, sampleRate: format.sampleRate) { [weak self] in
+            guard let self, self.playbackToken == token else { return }
+            onFinish()
+        }
+        let source = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
+            let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            guard buffers.count >= 2,
+                  let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
+                  let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+            renderer.render(frameCount: Int(frameCount), left: left, right: right)
+            return noErr
+        }
+
+        engine.attach(source)
+        engine.connect(source, to: engine.mainMixerNode, format: format)
+        engine.prepare()
+        try engine.start()
+        self.renderer = renderer
+        sourceNode = source
+        isPaused = false
+    }
+
+    func pause() {
+        guard engine.isRunning else { return }
+        engine.pause()
+        isPaused = true
+    }
+
+    func resume() throws {
+        guard isPaused else { return }
+        try engine.start()
+        isPaused = false
+    }
+
+    func stop() {
+        playbackToken = UUID()
+        engine.stop()
+        if let sourceNode {
+            engine.disconnectNodeOutput(sourceNode)
+            engine.detach(sourceNode)
+        }
+        sourceNode = nil
+        renderer = nil
+        isPaused = false
+    }
+}
+
+// MARK: - Multi-format tracker replay
+
+private final class XMPRenderer: @unchecked Sendable {
+    private let context: xmp_context
+    private let onFinish: () -> Void
+    private var samples = Array(repeating: Int16(0), count: 131_072)
+    private var ended = false
+    private var finishSent = false
+
+    init(module: TrackerModule, onFinish: @escaping () -> Void) throws {
+        guard let context = xmp_create_context() else {
+            throw TrackerPlaybackError.decoderUnavailable
+        }
+        self.context = context
+        self.onFinish = onFinish
+
+        _ = xmp_set_player(context, XMP_PLAYER_DEFPAN, 50)
+        let loadResult = module.data.withUnsafeBytes { bytes -> Int32 in
+            guard let baseAddress = bytes.baseAddress else { return -1 }
+            return xmp_load_module_from_memory(context, baseAddress, module.data.count)
+        }
+        guard loadResult == 0 else {
+            xmp_free_context(context)
+            throw TrackerPlaybackError.unsupportedModule
+        }
+        guard xmp_start_player(context, 48_000, 0) == 0 else {
+            xmp_release_module(context)
+            xmp_free_context(context)
+            throw TrackerPlaybackError.decoderUnavailable
+        }
+    }
+
+    deinit {
+        xmp_end_player(context)
+        xmp_release_module(context)
+        xmp_free_context(context)
+    }
+
+    func render(frameCount: Int, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>) {
+        guard !ended, frameCount > 0, frameCount * 2 <= samples.count else {
+            clear(frameCount: frameCount, left: left, right: right)
+            sendFinishOnce()
+            return
+        }
+
+        let byteCount = frameCount * 2 * MemoryLayout<Int16>.size
+        let result = samples.withUnsafeMutableBytes { buffer -> Int32 in
+            xmp_play_buffer(context, buffer.baseAddress, Int32(byteCount), 0)
+        }
+        for frame in 0..<frameCount {
+            left[frame] = Float(samples[frame * 2]) / 32_768
+            right[frame] = Float(samples[frame * 2 + 1]) / 32_768
+        }
+        if result != 0 {
+            ended = true
+            sendFinishOnce()
+        }
+    }
+
+    private func clear(frameCount: Int, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>) {
+        for frame in 0..<frameCount {
+            left[frame] = 0
+            right[frame] = 0
+        }
+    }
+
+    private func sendFinishOnce() {
+        guard !finishSent else { return }
+        finishSent = true
+        DispatchQueue.main.async { [onFinish] in onFinish() }
+    }
+}
+
+private final class TrackerAudioPlayer {
+    private let engine = AVAudioEngine()
+    private var sourceNode: AVAudioSourceNode?
+    private var renderer: XMPRenderer?
+    private var playbackToken = UUID()
+    private(set) var isPaused = false
+
+    func play(_ module: TrackerModule, onFinish: @escaping () -> Void) throws {
+        stop()
+        let token = UUID()
+        playbackToken = token
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let renderer = try XMPRenderer(module: module) { [weak self] in
+            guard let self, self.playbackToken == token else { return }
+            onFinish()
+        }
+        let source = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
+            let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            guard buffers.count >= 2,
+                  let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
+                  let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+            renderer.render(frameCount: Int(frameCount), left: left, right: right)
+            return noErr
+        }
+
+        engine.attach(source)
+        engine.connect(source, to: engine.mainMixerNode, format: format)
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            engine.disconnectNodeOutput(source)
+            engine.detach(source)
+            throw TrackerPlaybackError.audioSetupFailed
+        }
+        self.renderer = renderer
+        sourceNode = source
+        isPaused = false
+    }
+
+    func pause() {
+        guard engine.isRunning else { return }
+        engine.pause()
+        isPaused = true
+    }
+
+    func resume() throws {
+        guard isPaused else { return }
+        try engine.start()
+        isPaused = false
+    }
+
+    func stop() {
+        playbackToken = UUID()
+        engine.stop()
+        if let sourceNode {
+            engine.disconnectNodeOutput(sourceNode)
+            engine.detach(sourceNode)
+        }
+        sourceNode = nil
+        renderer = nil
+        isPaused = false
+    }
+}
+
+private final class UniversalTrackerAudioPlayer {
+    private enum Backend {
+        case xmp
+        case nativeMOD
+    }
+
+    private let xmpPlayer = TrackerAudioPlayer()
+    private let modPlayer = MODAudioPlayer()
+    private var backend: Backend?
+
+    func play(_ module: TrackerModule, onFinish: @escaping () -> Void) throws {
+        stop()
+        if let fallback = module.fallbackMOD {
+            try modPlayer.play(fallback, onFinish: onFinish)
+            backend = .nativeMOD
+        } else {
+            try xmpPlayer.play(module, onFinish: onFinish)
+            backend = .xmp
+        }
+    }
+
+    func pause() {
+        switch backend {
+        case .xmp: xmpPlayer.pause()
+        case .nativeMOD: modPlayer.pause()
+        case nil: break
+        }
+    }
+
+    func resume() throws {
+        switch backend {
+        case .xmp: try xmpPlayer.resume()
+        case .nativeMOD: try modPlayer.resume()
+        case nil: break
+        }
+    }
+
+    func stop() {
+        xmpPlayer.stop()
+        modPlayer.stop()
+        backend = nil
+    }
+}
+
+// MARK: - Radio state
+
+private enum RadioPhase: Equatable {
+    case stopped
+    case loading
+    case playing
+    case paused
+    case failed(String)
+}
+
+private final class RadioController {
+    var onChange: (() -> Void)?
+    private(set) var phase: RadioPhase = .stopped { didSet { onChange?() } }
+    private(set) var track: RadioTrack? { didSet { onChange?() } }
+    private let audioPlayer = UniversalTrackerAudioPlayer()
+    private let session: URLSession
+    private var task: URLSessionDataTask?
+    private var stationIsOn = false
+    private var unsupportedSkips = 0
+    private var nextFormat = CatalogueFormat.random
+
+    init() {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpAdditionalHeaders = ["User-Agent": "ModRadio/0.1 macOS"]
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 45
+        session = URLSession(configuration: configuration)
+    }
+
+    func playRandom() {
+        stationIsOn = true
+        unsupportedSkips = 0
+        loadRandomTrack()
+    }
+
+    func playAnother() {
+        stationIsOn = true
+        loadRandomTrack()
+    }
+
+    func togglePause() {
+        switch phase {
+        case .playing:
+            audioPlayer.pause()
+            phase = .paused
+        case .paused:
+            do {
+                try audioPlayer.resume()
+                phase = .playing
+            } catch {
+                phase = .failed("Audio could not resume.")
+            }
+        default:
+            break
+        }
+    }
+
+    func stop() {
+        stationIsOn = false
+        task?.cancel()
+        task = nil
+        audioPlayer.stop()
+        phase = .stopped
+    }
+
+    private func loadRandomTrack() {
+        task?.cancel()
+        audioPlayer.stop()
+        phase = .loading
+
+        let requestedFormat = nextFormat
+        nextFormat = requestedFormat == .mod ? .xm : .mod
+        task = session.dataTask(with: requestedFormat.endpoint) { [weak self] data, _, error in
+            guard let self else { return }
+            if let error = error as? URLError, error.code == .cancelled { return }
+            guard error == nil, let data else {
+                DispatchQueue.main.async { self.phase = .failed("Couldn’t reach BassoonTracker.") }
+                return
+            }
+
+            do {
+                let track = try BassoonCatalogue.parseRandomTrack(from: data)
+                self.download(track)
+            } catch {
+                DispatchQueue.main.async { self.phase = .failed(error.localizedDescription) }
+            }
+        }
+        task?.resume()
+    }
+
+    private func download(_ track: RadioTrack) {
+        task = session.dataTask(with: track.downloadURL) { [weak self] data, _, error in
+            guard let self else { return }
+            if let error = error as? URLError, error.code == .cancelled { return }
+            guard error == nil, let data else {
+                DispatchQueue.main.async { self.phase = .failed("The MOD could not be downloaded.") }
+                return
+            }
+
+            do {
+                let module = try TrackerModule(data: data)
+                DispatchQueue.main.async {
+                    guard self.stationIsOn else { return }
+                    self.track = RadioTrack(
+                        title: module.title.isEmpty ? track.displayTitle : module.title,
+                        artist: track.artist,
+                        format: module.format,
+                        downloadURL: track.downloadURL,
+                        informationURL: track.informationURL
+                    )
+                    do {
+                        try self.audioPlayer.play(module) { [weak self] in
+                            guard let self, self.stationIsOn else { return }
+                            self.loadRandomTrack()
+                        }
+                        self.unsupportedSkips = 0
+                        self.phase = .playing
+                    } catch {
+                        self.phase = .failed("The Mac audio engine could not start.")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard self.stationIsOn else { return }
+                    if self.unsupportedSkips < 3 {
+                        self.unsupportedSkips += 1
+                        self.phase = .loading
+                        self.loadRandomTrack()
+                    } else {
+                        self.phase = .failed(error.localizedDescription)
+                    }
+                }
+            }
+        }
+        task?.resume()
+    }
+}
+
+// MARK: - Menu bar application
+
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let radio = RadioController()
+    private var statusItem: NSStatusItem!
+    private let menu = NSMenu()
+    private let titleItem = NSMenuItem(title: "MOD Radio", action: nil, keyEquivalent: "")
+    private let detailItem = NSMenuItem(title: "Ready for a random module", action: nil, keyEquivalent: "")
+    private let playItem = NSMenuItem(title: "Play Random MOD or XM", action: #selector(playRandom), keyEquivalent: "r")
+    private let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: " ")
+    private let stopItem = NSMenuItem(title: "Stop Radio", action: #selector(stopRadio), keyEquivalent: ".")
+    private let bassoonItem = NSMenuItem(title: "Open in BassoonTracker", action: #selector(openInBassoon), keyEquivalent: "")
+    private let informationItem = NSMenuItem(title: "View Module Page", action: #selector(openInformation), keyEquivalent: "")
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.button?.toolTip = "MOD Radio"
+        statusItem.menu = menu
+        menu.delegate = self
+
+        titleItem.isEnabled = false
+        detailItem.isEnabled = false
+        for item in [titleItem, detailItem, NSMenuItem.separator(), playItem, pauseItem, stopItem,
+                     NSMenuItem.separator(), bassoonItem, informationItem, NSMenuItem.separator()] {
+            item.target = self
+            menu.addItem(item)
+        }
+        menu.addItem(withTitle: "About ModRadio", action: #selector(showAbout), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Quit MOD Radio", action: #selector(quit), keyEquivalent: "q").target = self
+
+        radio.onChange = { [weak self] in self?.refresh() }
+        refresh()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        radio.stop()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+    }
+
+    private func refresh() {
+        let track = radio.track
+        titleItem.title = track?.displayTitle ?? "MOD Radio"
+        switch radio.phase {
+        case .stopped:
+            detailItem.title = "Ready for a random module"
+            playItem.title = track == nil ? "Play Random MOD or XM" : "Start with Another Track"
+            pauseItem.isEnabled = false
+            stopItem.isEnabled = false
+            setSymbol("radio", description: "ModRadio")
+        case .loading:
+            detailItem.title = "Finding a random MOD or XM…"
+            playItem.title = "Try Another Track"
+            pauseItem.isEnabled = false
+            stopItem.isEnabled = true
+            setSymbol("arrow.triangle.2.circlepath", description: "Finding a random tracker song")
+        case .playing:
+            detailItem.title = trackDetails(prefix: "Playing", track: track)
+            playItem.title = "Play Another Track"
+            pauseItem.title = "Pause"
+            pauseItem.isEnabled = true
+            stopItem.isEnabled = true
+            setSymbol("waveform.circle.fill", description: "Playing MOD Radio")
+        case .paused:
+            detailItem.title = trackDetails(prefix: "Paused", track: track)
+            playItem.title = "Play Another Track"
+            pauseItem.title = "Resume"
+            pauseItem.isEnabled = true
+            stopItem.isEnabled = true
+            setSymbol("pause.circle.fill", description: "MOD Radio paused")
+        case .failed(let message):
+            detailItem.title = message
+            playItem.title = "Try Another Track"
+            pauseItem.isEnabled = false
+            stopItem.isEnabled = true
+            setSymbol("exclamationmark.circle", description: "MOD Radio needs attention")
+        }
+        bassoonItem.isEnabled = track != nil
+        informationItem.isEnabled = track?.informationURL != nil
+    }
+
+    private func trackDetails(prefix: String, track: RadioTrack?) -> String {
+        let details = [track?.format, track?.artist]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return details.isEmpty ? prefix : prefix + " • " + details.joined(separator: " • ")
+    }
+
+    private func setSymbol(_ name: String, description: String) {
+        let configuration = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: description)?
+            .withSymbolConfiguration(configuration)
+        image?.isTemplate = true
+        statusItem.button?.image = image
+    }
+
+    @objc private func playRandom() {
+        radio.track == nil ? radio.playRandom() : radio.playAnother()
+    }
+
+    @objc private func togglePause() { radio.togglePause() }
+    @objc private func stopRadio() { radio.stop() }
+
+    @objc private func openInBassoon() {
+        guard let track = radio.track else { return }
+        var components = URLComponents(string: "https://www.stef.be/bassoontracker/")!
+        components.queryItems = [URLQueryItem(name: "file", value: track.downloadURL.absoluteString)]
+        if let url = components.url { NSWorkspace.shared.open(url) }
+    }
+
+    @objc private func openInformation() {
+        if let url = radio.track?.informationURL { NSWorkspace.shared.open(url) }
+    }
+
+    @objc private func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
+    }
+
+    @objc private func quit() { NSApp.terminate(nil) }
+}
+
+// MARK: - Command-line verification and entry point
+
+private func runModuleCheck(path: String) -> Never {
+    do {
+        let module = try TrackerModule(data: Data(contentsOf: URL(fileURLWithPath: path)))
+        print("title=\(module.title)")
+        print("format=\(module.format)")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data(("modradio: \(error.localizedDescription)\n").utf8))
+        exit(1)
+    }
+}
+
+private func blockingDownload(_ url: URL) throws -> Data {
+    let semaphore = DispatchSemaphore(value: 0)
+    var outcome: Result<Data, Error>!
+    let task = URLSession.shared.dataTask(with: url) { data, _, error in
+        if let error { outcome = .failure(error) }
+        else if let data { outcome = .success(data) }
+        else { outcome = .failure(CatalogueError.invalidResponse) }
+        semaphore.signal()
+    }
+    task.resume()
+    semaphore.wait()
+    return try outcome.get()
+}
+
+private func runSmokeTest(format: CatalogueFormat = .random) -> Never {
+    do {
+        let response = try blockingDownload(format.endpoint)
+        let track = try BassoonCatalogue.parseRandomTrack(from: response)
+        let module = try TrackerModule(data: blockingDownload(track.downloadURL))
+        let player = UniversalTrackerAudioPlayer()
+        try player.play(module) {}
+        Thread.sleep(forTimeInterval: 2)
+        player.stop()
+        print("random_track=\(track.displayTitle)")
+        print("format=\(module.format)")
+        print("audio_engine=started")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data(("modradio: smoke test failed: \(error.localizedDescription)\n").utf8))
+        exit(1)
+    }
+}
+
+private func runLocalPlaybackCheck(path: String) -> Never {
+    do {
+        let module = try TrackerModule(data: Data(contentsOf: URL(fileURLWithPath: path)))
+        let player = UniversalTrackerAudioPlayer()
+        try player.play(module) {}
+        Thread.sleep(forTimeInterval: 2)
+        player.stop()
+        print("local_track=\(module.title)")
+        print("format=\(module.format)")
+        print("audio_engine=started")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data(("modradio: local playback check failed: \(error.localizedDescription)\n").utf8))
+        exit(1)
+    }
+}
+
+@main
+struct ModRadioApplication {
+    @MainActor
+    static func main() {
+        if let index = CommandLine.arguments.firstIndex(where: { ["--check-mod", "--check-module"].contains($0) }),
+           CommandLine.arguments.indices.contains(index + 1) {
+            runModuleCheck(path: CommandLine.arguments[index + 1])
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--smoke-mod"),
+           CommandLine.arguments.indices.contains(index + 1) {
+            runLocalPlaybackCheck(path: CommandLine.arguments[index + 1])
+        }
+        if CommandLine.arguments.contains("--smoke-xm") { runSmokeTest(format: .xm) }
+        if CommandLine.arguments.contains("--smoke-test") { runSmokeTest() }
+
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        application.run()
+        withExtendedLifetime(delegate) {}
+    }
+}
