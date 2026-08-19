@@ -14,7 +14,7 @@ always-available random tracker station useful and enjoyable?
 - Original multi-resolution Finder and Applications icon
 - Clear native radio symbol in the menu bar
 - Random MOD and XM discovery through BassoonTracker and The Mod Archive
-- Continuous play, pause, resume, skip, and stop
+- Continuous play, pause, resume, skip, stop, and persistent in-menu volume control
 - Song title and available artist attribution
 - Links to the current song in BassoonTracker and The Mod Archive
 - Bundled libxmp-lite replay engine with no external runtime installation

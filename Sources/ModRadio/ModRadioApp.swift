@@ -647,6 +647,7 @@ private final class MODAudioPlayer {
     private var sourceNode: AVAudioSourceNode?
     private var renderer: MODRenderer?
     private var playbackToken = UUID()
+    private var outputVolume: Float = 0.8
     private(set) var isPaused = false
 
     func play(_ module: MODModule, onFinish: @escaping () -> Void) throws {
@@ -669,11 +670,17 @@ private final class MODAudioPlayer {
 
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = outputVolume
         engine.prepare()
         try engine.start()
         self.renderer = renderer
         sourceNode = source
         isPaused = false
+    }
+
+    func setVolume(_ value: Float) {
+        outputVolume = max(0, min(1, value))
+        engine.mainMixerNode.outputVolume = outputVolume
     }
 
     func pause() {
@@ -779,6 +786,7 @@ private final class TrackerAudioPlayer {
     private var sourceNode: AVAudioSourceNode?
     private var renderer: XMPRenderer?
     private var playbackToken = UUID()
+    private var outputVolume: Float = 0.8
     private(set) var isPaused = false
 
     func play(_ module: TrackerModule, onFinish: @escaping () -> Void) throws {
@@ -801,6 +809,7 @@ private final class TrackerAudioPlayer {
 
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = outputVolume
         engine.prepare()
         do {
             try engine.start()
@@ -812,6 +821,11 @@ private final class TrackerAudioPlayer {
         self.renderer = renderer
         sourceNode = source
         isPaused = false
+    }
+
+    func setVolume(_ value: Float) {
+        outputVolume = max(0, min(1, value))
+        engine.mainMixerNode.outputVolume = outputVolume
     }
 
     func pause() {
@@ -848,6 +862,7 @@ private final class UniversalTrackerAudioPlayer {
     private let xmpPlayer = TrackerAudioPlayer()
     private let modPlayer = MODAudioPlayer()
     private var backend: Backend?
+    private(set) var volume: Float = 0.8
 
     func play(_ module: TrackerModule, onFinish: @escaping () -> Void) throws {
         stop()
@@ -876,6 +891,12 @@ private final class UniversalTrackerAudioPlayer {
         }
     }
 
+    func setVolume(_ value: Float) {
+        volume = max(0, min(1, value))
+        xmpPlayer.setVolume(volume)
+        modPlayer.setVolume(volume)
+    }
+
     func stop() {
         xmpPlayer.stop()
         modPlayer.stop()
@@ -894,6 +915,8 @@ private enum RadioPhase: Equatable {
 }
 
 private final class RadioController {
+    private static let volumeDefaultsKey = "playbackVolume"
+
     var onChange: (() -> Void)?
     private(set) var phase: RadioPhase = .stopped { didSet { onChange?() } }
     private(set) var track: RadioTrack? { didSet { onChange?() } }
@@ -910,6 +933,15 @@ private final class RadioController {
         configuration.timeoutIntervalForRequest = 20
         configuration.timeoutIntervalForResource = 45
         session = URLSession(configuration: configuration)
+        let savedVolume = UserDefaults.standard.object(forKey: Self.volumeDefaultsKey) as? Double
+        audioPlayer.setVolume(Float(savedVolume ?? 0.8))
+    }
+
+    var volume: Float { audioPlayer.volume }
+
+    func setVolume(_ value: Float) {
+        audioPlayer.setVolume(value)
+        UserDefaults.standard.set(Double(audioPlayer.volume), forKey: Self.volumeDefaultsKey)
     }
 
     func playRandom() {
@@ -1032,6 +1064,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let playItem = NSMenuItem(title: "Play Random MOD or XM", action: #selector(playRandom), keyEquivalent: "r")
     private let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: " ")
     private let stopItem = NSMenuItem(title: "Stop Radio", action: #selector(stopRadio), keyEquivalent: ".")
+    private let volumeItem = NSMenuItem()
+    private let volumeSlider = NSSlider(value: 0.8, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let volumeImageView = NSImageView()
     private let bassoonItem = NSMenuItem(title: "Open in BassoonTracker", action: #selector(openInBassoon), keyEquivalent: "")
     private let informationItem = NSMenuItem(title: "View Module Page", action: #selector(openInformation), keyEquivalent: "")
 
@@ -1044,8 +1079,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         titleItem.isEnabled = false
         detailItem.isEnabled = false
+        configureVolumeItem()
         for item in [titleItem, detailItem, NSMenuItem.separator(), playItem, pauseItem, stopItem,
-                     NSMenuItem.separator(), bassoonItem, informationItem, NSMenuItem.separator()] {
+                     NSMenuItem.separator(), volumeItem, NSMenuItem.separator(), bassoonItem,
+                     informationItem, NSMenuItem.separator()] {
             item.target = self
             menu.addItem(item)
         }
@@ -1120,12 +1157,59 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         statusItem.button?.image = image
     }
 
+    private func configureVolumeItem() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 270, height: 38))
+        volumeImageView.frame = NSRect(x: 14, y: 10, width: 18, height: 18)
+        volumeImageView.imageScaling = .scaleProportionallyDown
+        container.addSubview(volumeImageView)
+
+        volumeSlider.frame = NSRect(x: 43, y: 7, width: 213, height: 24)
+        volumeSlider.doubleValue = Double(radio.volume)
+        volumeSlider.isContinuous = true
+        volumeSlider.altIncrementValue = 0.05
+        volumeSlider.target = self
+        volumeSlider.action = #selector(volumeChanged(_:))
+        volumeSlider.toolTip = "Playback volume"
+        volumeSlider.setAccessibilityLabel("Playback volume")
+        container.addSubview(volumeSlider)
+
+        volumeItem.view = container
+        refreshVolumeIcon()
+    }
+
+    private func refreshVolumeIcon() {
+        let name: String
+        let description: String
+        switch volumeSlider.doubleValue {
+        case ...0.001:
+            name = "speaker.slash.fill"
+            description = "Muted"
+        case ..<0.34:
+            name = "speaker.wave.1.fill"
+            description = "Low playback volume"
+        case ..<0.67:
+            name = "speaker.wave.2.fill"
+            description = "Medium playback volume"
+        default:
+            name = "speaker.wave.3.fill"
+            description = "High playback volume"
+        }
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: description)
+        image?.isTemplate = true
+        volumeImageView.image = image
+    }
+
     @objc private func playRandom() {
         radio.track == nil ? radio.playRandom() : radio.playAnother()
     }
 
     @objc private func togglePause() { radio.togglePause() }
     @objc private func stopRadio() { radio.stop() }
+
+    @objc private func volumeChanged(_ sender: NSSlider) {
+        radio.setVolume(Float(sender.doubleValue))
+        refreshVolumeIcon()
+    }
 
     @objc private func openInBassoon() {
         guard let track = radio.track else { return }
