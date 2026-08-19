@@ -10,6 +10,9 @@ application bundle.
   package manager or library installation on the user’s Mac.
 - `Support/` owns bundle metadata and the original Finder icon. The menu bar
   uses Apple’s native radio symbol for immediate recognition.
+- `Support/ModRadio.entitlements` enables App Sandbox and grants only outbound
+  network connections. No file, process automation, incoming network, personal
+  information, or device entitlements are present.
 - `scripts/build-app.sh` builds the Swift package, assembles the app bundle,
   signs it, and verifies the signature.
 - `scripts/install-app.sh` replaces only `/Applications/ModRadio.app` and opens
@@ -19,3 +22,7 @@ The single Swift target is deliberate for version 0.1. If playlists,
 favourites, or multiple catalogues prove useful, catalogue behavior can move
 into a testable `ModRadioCore` target without changing the bundle or UI
 boundary. The C decoder remains isolated behind `TrackerAudioPlayer`.
+
+Downloaded modules are held in memory. The shipped executable has no arbitrary
+path-reading command and does not launch or inspect other processes. External
+module links are handed to macOS through `NSWorkspace`.

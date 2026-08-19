@@ -1148,18 +1148,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
 // MARK: - Command-line verification and entry point
 
-private func runModuleCheck(path: String) -> Never {
-    do {
-        let module = try TrackerModule(data: Data(contentsOf: URL(fileURLWithPath: path)))
-        print("title=\(module.title)")
-        print("format=\(module.format)")
-        exit(0)
-    } catch {
-        FileHandle.standardError.write(Data(("modradio: \(error.localizedDescription)\n").utf8))
-        exit(1)
-    }
-}
-
 private func blockingDownload(_ url: URL) throws -> Data {
     let semaphore = DispatchSemaphore(value: 0)
     var outcome: Result<Data, Error>!
@@ -1193,9 +1181,10 @@ private func runSmokeTest(format: CatalogueFormat = .random) -> Never {
     }
 }
 
-private func runLocalPlaybackCheck(path: String) -> Never {
+private func runStandardInputPlaybackCheck() -> Never {
     do {
-        let module = try TrackerModule(data: Data(contentsOf: URL(fileURLWithPath: path)))
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        let module = try TrackerModule(data: data)
         let player = UniversalTrackerAudioPlayer()
         try player.play(module) {}
         Thread.sleep(forTimeInterval: 2)
@@ -1205,7 +1194,7 @@ private func runLocalPlaybackCheck(path: String) -> Never {
         print("audio_engine=started")
         exit(0)
     } catch {
-        FileHandle.standardError.write(Data(("modradio: local playback check failed: \(error.localizedDescription)\n").utf8))
+        FileHandle.standardError.write(Data(("modradio: standard-input playback check failed: \(error.localizedDescription)\n").utf8))
         exit(1)
     }
 }
@@ -1214,14 +1203,7 @@ private func runLocalPlaybackCheck(path: String) -> Never {
 struct ModRadioApplication {
     @MainActor
     static func main() {
-        if let index = CommandLine.arguments.firstIndex(where: { ["--check-mod", "--check-module"].contains($0) }),
-           CommandLine.arguments.indices.contains(index + 1) {
-            runModuleCheck(path: CommandLine.arguments[index + 1])
-        }
-        if let index = CommandLine.arguments.firstIndex(of: "--smoke-mod"),
-           CommandLine.arguments.indices.contains(index + 1) {
-            runLocalPlaybackCheck(path: CommandLine.arguments[index + 1])
-        }
+        if CommandLine.arguments.contains("--smoke-stdin") { runStandardInputPlaybackCheck() }
         if CommandLine.arguments.contains("--smoke-xm") { runSmokeTest(format: .xm) }
         if CommandLine.arguments.contains("--smoke-test") { runSmokeTest() }
 

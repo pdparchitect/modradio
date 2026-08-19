@@ -64,8 +64,17 @@ Run an end-to-end playback check:
 To verify parsing and audio without depending on the catalogue service:
 
 ```sh
-.build/ModRadio.app/Contents/MacOS/ModRadio --smoke-mod /path/to/song.mod
+.build/ModRadio.app/Contents/MacOS/ModRadio --smoke-stdin < /path/to/song.mod
 ```
+
+## Security boundary
+
+ModRadio runs inside the macOS App Sandbox. Its signed entitlement set contains
+only the sandbox itself and outbound network access for BassoonTracker. It has
+no file-selection, Downloads, Music, Pictures, Movies, process automation,
+incoming-network, microphone, camera, Bluetooth, USB, or location access.
+Downloaded module data stays in memory and preferences, if introduced later,
+remain inside the app’s private container.
 
 ## Project layout
 
@@ -75,6 +84,8 @@ Vendor/LibXMP.xcframework
                         Pinned libxmp-lite 4.7.2 decoder for Apple silicon
 Support/AppIcon.png     Generated 1024px application-icon master
 Support/ModRadio.icns   Multi-resolution Finder and launch icon
+Support/ModRadio.entitlements
+                        Deny-by-default sandbox and outbound network access
 scripts/                Build, sign, launch, and install workflows
 docs/architecture.md    Current boundaries and extension direction
 THIRD_PARTY_NOTICES.md  Bundled decoder version, provenance, and licence
