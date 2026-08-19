@@ -88,12 +88,14 @@ private enum TrackerPlaybackError: Error, LocalizedError {
     case unsupportedModule
     case decoderUnavailable
     case audioSetupFailed
+    case timelineUnavailable
 
     var errorDescription: String? {
         switch self {
         case .unsupportedModule: return "This tracker file could not be decoded."
         case .decoderUnavailable: return "The tracker replay engine could not start."
         case .audioSetupFailed: return "The Mac audio engine could not start."
+        case .timelineUnavailable: return "The track timeline could not be read or seeked."
         }
     }
 }
@@ -304,6 +306,12 @@ private enum MODParser {
 
 // MARK: - Minimal native MOD replay engine
 
+private struct PlaybackProgress {
+    let elapsed: TimeInterval
+    let duration: TimeInterval?
+    let canSeek: Bool
+}
+
 private final class MODChannel {
     var sampleIndex = -1
     var samplePosition = 0.0
@@ -340,6 +348,7 @@ private final class MODRenderer: @unchecked Sendable {
     private var positionVisits: [Int]
     private var ended = false
     private var finishSent = false
+    private let lock = NSLock()
 
     init(module: MODModule, sampleRate: Double, onFinish: @escaping () -> Void) {
         self.module = module
@@ -351,6 +360,8 @@ private final class MODRenderer: @unchecked Sendable {
     }
 
     func render(frameCount: Int, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>) {
+        lock.lock()
+        defer { lock.unlock() }
         for frame in 0..<frameCount {
             if framesRemainingInTick <= 0 && !ended { prepareNextTick() }
             guard !ended else {
@@ -397,6 +408,16 @@ private final class MODRenderer: @unchecked Sendable {
             totalFrames += 1
             if totalFrames >= Int(sampleRate * 60 * 12) { ended = true }
         }
+    }
+
+    func progress() -> PlaybackProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        return PlaybackProgress(
+            elapsed: Double(totalFrames) / sampleRate,
+            duration: nil,
+            canSeek: false
+        )
     }
 
     private func normalizePosition(_ channel: MODChannel, sample: MODSample) {
@@ -631,7 +652,7 @@ private final class MODRenderer: @unchecked Sendable {
         guard songPosition >= 0 && songPosition < module.orders.count else { ended = true; return }
         if row == 0 || pendingPositionJump != nil || pendingBreakRow != nil {
             positionVisits[songPosition] += 1
-            if positionVisits[songPosition] > 2 { ended = true }
+            if positionVisits[songPosition] > 1 { ended = true }
         }
     }
 
@@ -683,6 +704,8 @@ private final class MODAudioPlayer {
         engine.mainMixerNode.outputVolume = outputVolume
     }
 
+    func progress() -> PlaybackProgress? { renderer?.progress() }
+
     func pause() {
         guard engine.isRunning else { return }
         engine.pause()
@@ -716,6 +739,7 @@ private final class XMPRenderer: @unchecked Sendable {
     private var samples = Array(repeating: Int16(0), count: 131_072)
     private var ended = false
     private var finishSent = false
+    private let lock = NSLock()
 
     init(module: TrackerModule, onFinish: @escaping () -> Void) throws {
         guard let context = xmp_create_context() else {
@@ -747,6 +771,8 @@ private final class XMPRenderer: @unchecked Sendable {
     }
 
     func render(frameCount: Int, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>) {
+        lock.lock()
+        defer { lock.unlock() }
         guard !ended, frameCount > 0, frameCount * 2 <= samples.count else {
             clear(frameCount: frameCount, left: left, right: right)
             sendFinishOnce()
@@ -755,7 +781,7 @@ private final class XMPRenderer: @unchecked Sendable {
 
         let byteCount = frameCount * 2 * MemoryLayout<Int16>.size
         let result = samples.withUnsafeMutableBytes { buffer -> Int32 in
-            xmp_play_buffer(context, buffer.baseAddress, Int32(byteCount), 0)
+            xmp_play_buffer(context, buffer.baseAddress, Int32(byteCount), 1)
         }
         for frame in 0..<frameCount {
             left[frame] = Float(samples[frame * 2]) / 32_768
@@ -764,6 +790,42 @@ private final class XMPRenderer: @unchecked Sendable {
         if result != 0 {
             ended = true
             sendFinishOnce()
+        }
+    }
+
+    func progress() -> PlaybackProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        var information = xmp_frame_info()
+        xmp_get_frame_info(context, &information)
+        let elapsed = TimeInterval(max(0, information.time)) / 1_000
+        let durationMilliseconds = max(0, information.total_time)
+        let duration = durationMilliseconds > 0
+            ? TimeInterval(durationMilliseconds) / 1_000
+            : nil
+        return PlaybackProgress(
+            elapsed: duration.map { min(elapsed, $0) } ?? elapsed,
+            duration: duration,
+            canSeek: duration != nil
+        )
+    }
+
+    func seek(to seconds: TimeInterval, precise: Bool = false) {
+        lock.lock()
+        defer { lock.unlock() }
+        var information = xmp_frame_info()
+        xmp_get_frame_info(context, &information)
+        guard information.total_time > 0 else { return }
+        let milliseconds = min(
+            max(0, Int(seconds * 1_000)),
+            max(0, Int(information.total_time) - 1)
+        )
+        let result = precise
+            ? xmp_seek_time_frame(context, Int32(milliseconds))
+            : xmp_seek_time(context, Int32(milliseconds))
+        if result >= 0 {
+            ended = false
+            finishSent = false
         }
     }
 
@@ -826,6 +888,12 @@ private final class TrackerAudioPlayer {
     func setVolume(_ value: Float) {
         outputVolume = max(0, min(1, value))
         engine.mainMixerNode.outputVolume = outputVolume
+    }
+
+    func progress() -> PlaybackProgress? { renderer?.progress() }
+
+    func seek(to seconds: TimeInterval, precise: Bool = false) {
+        renderer?.seek(to: seconds, precise: precise)
     }
 
     func pause() {
@@ -897,6 +965,18 @@ private final class UniversalTrackerAudioPlayer {
         modPlayer.setVolume(volume)
     }
 
+    func progress() -> PlaybackProgress? {
+        switch backend {
+        case .xmp: return xmpPlayer.progress()
+        case .nativeMOD: return modPlayer.progress()
+        case nil: return nil
+        }
+    }
+
+    func seek(to seconds: TimeInterval, precise: Bool = false) {
+        if case .xmp = backend { xmpPlayer.seek(to: seconds, precise: precise) }
+    }
+
     func stop() {
         xmpPlayer.stop()
         modPlayer.stop()
@@ -939,10 +1019,14 @@ private final class RadioController {
 
     var volume: Float { audioPlayer.volume }
 
+    var playbackProgress: PlaybackProgress? { audioPlayer.progress() }
+
     func setVolume(_ value: Float) {
         audioPlayer.setVolume(value)
         UserDefaults.standard.set(Double(audioPlayer.volume), forKey: Self.volumeDefaultsKey)
     }
+
+    func seek(to seconds: TimeInterval) { audioPlayer.seek(to: seconds) }
 
     func playRandom() {
         stationIsOn = true
@@ -1061,6 +1145,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let menu = NSMenu()
     private let titleItem = NSMenuItem(title: "MOD Radio", action: nil, keyEquivalent: "")
     private let detailItem = NSMenuItem(title: "Ready for a random module", action: nil, keyEquivalent: "")
+    private let progressItem = NSMenuItem()
+    private let progressSlider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let elapsedLabel = NSTextField(labelWithString: "0:00")
+    private let durationLabel = NSTextField(labelWithString: "—")
     private let playItem = NSMenuItem(title: "Play Random MOD or XM", action: #selector(playRandom), keyEquivalent: "r")
     private let pauseItem = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: " ")
     private let stopItem = NSMenuItem(title: "Stop Radio", action: #selector(stopRadio), keyEquivalent: ".")
@@ -1069,6 +1157,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let volumeImageView = NSImageView()
     private let bassoonItem = NSMenuItem(title: "Open in BassoonTracker", action: #selector(openInBassoon), keyEquivalent: "")
     private let informationItem = NSMenuItem(title: "View Module Page", action: #selector(openInformation), keyEquivalent: "")
+    private var progressTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1079,8 +1168,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         titleItem.isEnabled = false
         detailItem.isEnabled = false
+        configureProgressItem()
         configureVolumeItem()
-        for item in [titleItem, detailItem, NSMenuItem.separator(), playItem, pauseItem, stopItem,
+        for item in [titleItem, detailItem, progressItem, NSMenuItem.separator(), playItem, pauseItem, stopItem,
                      NSMenuItem.separator(), volumeItem, NSMenuItem.separator(), bassoonItem,
                      informationItem, NSMenuItem.separator()] {
             item.target = self
@@ -1090,10 +1180,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(withTitle: "Quit MOD Radio", action: #selector(quit), keyEquivalent: "q").target = self
 
         radio.onChange = { [weak self] in self?.refresh() }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.updateProgress()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        progressTimer = timer
         refresh()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        progressTimer?.invalidate()
         radio.stop()
     }
 
@@ -1140,6 +1236,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         bassoonItem.isEnabled = track != nil
         informationItem.isEnabled = track?.informationURL != nil
+        updateProgress()
     }
 
     private func trackDetails(prefix: String, track: RadioTrack?) -> String {
@@ -1155,6 +1252,73 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             .withSymbolConfiguration(configuration)
         image?.isTemplate = true
         statusItem.button?.image = image
+    }
+
+    private func configureProgressItem() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 270, height: 48))
+        progressSlider.frame = NSRect(x: 14, y: 22, width: 242, height: 20)
+        progressSlider.isContinuous = true
+        progressSlider.isEnabled = false
+        progressSlider.target = self
+        progressSlider.action = #selector(progressChanged(_:))
+        progressSlider.toolTip = "Track position"
+        progressSlider.setAccessibilityLabel("Track position")
+        container.addSubview(progressSlider)
+
+        let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        elapsedLabel.frame = NSRect(x: 15, y: 5, width: 100, height: 14)
+        elapsedLabel.font = timeFont
+        elapsedLabel.textColor = .secondaryLabelColor
+        container.addSubview(elapsedLabel)
+
+        durationLabel.frame = NSRect(x: 155, y: 5, width: 100, height: 14)
+        durationLabel.font = timeFont
+        durationLabel.textColor = .secondaryLabelColor
+        durationLabel.alignment = .right
+        container.addSubview(durationLabel)
+
+        progressItem.view = container
+    }
+
+    private func updateProgress() {
+        let isPlaying: Bool
+        switch radio.phase {
+        case .playing, .paused: isPlaying = true
+        default: isPlaying = false
+        }
+        guard isPlaying, let progress = radio.playbackProgress else {
+            progressSlider.minValue = 0
+            progressSlider.maxValue = 1
+            progressSlider.doubleValue = 0
+            progressSlider.isEnabled = false
+            elapsedLabel.stringValue = "0:00"
+            durationLabel.stringValue = "—"
+            return
+        }
+
+        elapsedLabel.stringValue = formattedTime(progress.elapsed)
+        if let duration = progress.duration, duration > 0 {
+            progressSlider.minValue = 0
+            progressSlider.maxValue = duration
+            progressSlider.doubleValue = min(progress.elapsed, duration)
+            progressSlider.isEnabled = progress.canSeek
+            durationLabel.stringValue = formattedTime(duration)
+        } else {
+            progressSlider.minValue = 0
+            progressSlider.maxValue = 1
+            progressSlider.doubleValue = 0
+            progressSlider.isEnabled = false
+            durationLabel.stringValue = "—"
+        }
+    }
+
+    private func formattedTime(_ interval: TimeInterval) -> String {
+        let totalSeconds = max(0, Int(interval.rounded(.down)))
+        let hours = totalSeconds / 3_600
+        let minutes = (totalSeconds % 3_600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 { return String(format: "%d:%02d:%02d", hours, minutes, seconds) }
+        return String(format: "%d:%02d", minutes, seconds)
     }
 
     private func configureVolumeItem() {
@@ -1211,6 +1375,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshVolumeIcon()
     }
 
+    @objc private func progressChanged(_ sender: NSSlider) {
+        radio.seek(to: sender.doubleValue)
+        updateProgress()
+    }
+
     @objc private func openInBassoon() {
         guard let track = radio.track else { return }
         var components = URLComponents(string: "https://www.stef.be/bassoontracker/")!
@@ -1252,11 +1421,34 @@ private func runSmokeTest(format: CatalogueFormat = .random) -> Never {
         let track = try BassoonCatalogue.parseRandomTrack(from: response)
         let module = try TrackerModule(data: blockingDownload(track.downloadURL))
         let player = UniversalTrackerAudioPlayer()
-        try player.play(module) {}
-        Thread.sleep(forTimeInterval: 2)
+        var didFinish = false
+        try player.play(module) { didFinish = true }
+        Thread.sleep(forTimeInterval: 0.5)
+        guard let initialProgress = player.progress(),
+              let duration = initialProgress.duration,
+              initialProgress.canSeek,
+              duration > 4 else {
+            throw TrackerPlaybackError.timelineUnavailable
+        }
+        let seekTarget = min(duration - 1, max(2, duration * 0.5))
+        player.seek(to: seekTarget)
+        Thread.sleep(forTimeInterval: 0.5)
+        guard let seekedProgress = player.progress(),
+              seekedProgress.elapsed > initialProgress.elapsed else {
+            throw TrackerPlaybackError.timelineUnavailable
+        }
+        player.seek(to: max(0, duration - 0.5), precise: true)
+        let deadline = Date().addingTimeInterval(5)
+        while !didFinish && Date() < deadline {
+            RunLoop.current.run(until: min(deadline, Date().addingTimeInterval(0.1)))
+        }
+        guard didFinish else { throw TrackerPlaybackError.timelineUnavailable }
         player.stop()
         print("random_track=\(track.displayTitle)")
         print("format=\(module.format)")
+        print("duration_seconds=\(Int(duration))")
+        print("seek_seconds=\(Int(seekedProgress.elapsed))")
+        print("end_callback=received")
         print("audio_engine=started")
         exit(0)
     } catch {
@@ -1288,6 +1480,7 @@ struct ModRadioApplication {
     @MainActor
     static func main() {
         if CommandLine.arguments.contains("--smoke-stdin") { runStandardInputPlaybackCheck() }
+        if CommandLine.arguments.contains("--smoke-mod") { runSmokeTest(format: .mod) }
         if CommandLine.arguments.contains("--smoke-xm") { runSmokeTest(format: .xm) }
         if CommandLine.arguments.contains("--smoke-test") { runSmokeTest() }
 

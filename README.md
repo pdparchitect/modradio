@@ -15,6 +15,7 @@ always-available random tracker station useful and enjoyable?
 - Clear native radio symbol in the menu bar
 - Random MOD and XM discovery through BassoonTracker and The Mod Archive
 - Continuous play, pause, resume, skip, stop, and persistent in-menu volume control
+- Live elapsed and estimated total time with seeking for libxmp-backed tracks
 - Song title and available artist attribution
 - Links to the current song in BassoonTracker and The Mod Archive
 - Bundled libxmp-lite replay engine with no external runtime installation
@@ -22,11 +23,18 @@ always-available random tracker station useful and enjoyable?
 
 The bundled replay engine supports MOD, XM, S3M, and IT files. Continuous radio
 play alternates between the random MOD and random XM catalogues so both formats
-are represented. A small native
+are represented. Libxmp-backed tracks stop after their first complete traversal
+so modules with restart positions advance to a new radio track instead of
+looping indefinitely. A small native
 ProTracker fallback preserves compatibility with older MOD variants that the
 compact decoder does not recognize. The current radio catalogue deliberately
 selects between BassoonTracker’s random MOD and random XM feeds. Saved
 playlists, favourites, and offline storage remain future work.
+
+Most catalogue tracks expose an estimated duration through libxmp and can be
+seeked directly from the menu. Rare legacy MOD files handled by the native
+fallback show elapsed time only because their final duration cannot be known
+reliably without replaying the song.
 
 ## Build
 
