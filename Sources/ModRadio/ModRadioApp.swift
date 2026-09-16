@@ -1869,8 +1869,10 @@ private func runRadioTransitionSmokeTest() -> Never {
         print("transition=completed")
         exit(0)
     } catch {
+        let diagnostic = "phase=\(radio.phase), prefetched=\(radio.hasPrefetchedTrack), " +
+            "elapsed=\(radio.playbackProgress?.elapsed ?? -1), duration=\(radio.playbackProgress?.duration ?? -1)"
         radio.stop()
-        FileHandle.standardError.write(Data(("modradio: transition test failed: \(error.localizedDescription)\n").utf8))
+        FileHandle.standardError.write(Data(("modradio: transition test failed: \(error.localizedDescription) (\(diagnostic))\n").utf8))
         exit(1)
     }
 }
