@@ -24,3 +24,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Sparkle 2.9.4
+
+ModRadio uses [Sparkle](https://sparkle-project.org/) for software updates. Its original licence is included in the app at `Contents/Resources/Sparkle-LICENSE.txt`.
+
+## Noodle build helpers
+
+The SDK validation helper is adapted from [Noodle](https://github.com/pdparchitect/noodle), licensed under Apache-2.0. A copy is included in [Support/Noodle-LICENSE.txt](Support/Noodle-LICENSE.txt) and the app’s resources.

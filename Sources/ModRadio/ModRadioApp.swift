@@ -1505,7 +1505,9 @@ private final class SystemMediaController: NSObject {
 
 // MARK: - Menu bar application
 
+@MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let updater = AppUpdater()
     private let radio = RadioController()
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
@@ -1543,13 +1545,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             item.target = self
             menu.addItem(item)
         }
+        updater.addMenuItems(to: menu)
+        menu.addItem(.separator())
         menu.addItem(withTitle: "About ModRadio", action: #selector(showAbout), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Quit MOD Radio", action: #selector(quit), keyEquivalent: "q").target = self
 
+        updater.start()
         systemMedia = SystemMediaController(radio: radio)
         radio.onChange = { [weak self] in self?.refresh() }
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.updateProgress()
+            MainActor.assumeIsolated { self?.updateProgress() }
         }
         RunLoop.main.add(timer, forMode: .common)
         progressTimer = timer

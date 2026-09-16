@@ -14,11 +14,11 @@ application bundle.
   network connections. No file, process automation, incoming network, personal
   information, or device entitlements are present.
 - `scripts/build-app.sh` builds the Swift package, assembles the app bundle,
-  signs it, and verifies the signature.
+  signs each embedded component, and verifies the bundle and sandbox policy.
 - `scripts/install-app.sh` replaces only `/Applications/ModRadio.app` and opens
   the installed copy.
 
-The single Swift target is deliberate for version 0.1. If playlists,
+The single Swift target keeps this small application together. If playlists,
 favourites, or multiple catalogues prove useful, catalogue behavior can move
 into a testable `ModRadioCore` target without changing the bundle or UI
 boundary. The C decoder remains isolated behind `TrackerAudioPlayer`.
@@ -26,3 +26,5 @@ boundary. The C decoder remains isolated behind `TrackerAudioPlayer`.
 Downloaded modules are held in memory. The shipped executable has no arbitrary
 path-reading command and does not launch or inspect other processes. External
 module links are handed to macOS through `NSWorkspace`.
+
+The release updater lives in `AppUpdater.swift`. It adds native menu items and stays disabled in development builds. Sparkle is pinned in the Swift package; its installer service and helper executables are embedded inside the signed framework. See [security and privacy](security.md) for the update boundary.
