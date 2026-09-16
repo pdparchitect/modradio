@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.6] - 2026-09-16
+## [0.1.0] - 2026-09-16
 
 Initial public release for macOS 15 or later on Apple Silicon.
 
