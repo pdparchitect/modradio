@@ -4,6 +4,7 @@
 - [Security and privacy](security.md) — network access and the sandbox boundary.
 - [Development](development.md) — build and test the application.
 - [Architecture](architecture.md) — catalogue, decoder, and audio output.
+- [Downloads and updates](releases.md) — installation and update preferences.
 - [Changelog](../CHANGELOG.md) — changes by version.
 
 [Back to ModRadio](../README.md)
