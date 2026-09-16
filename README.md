@@ -17,9 +17,8 @@
 
 </div>
 
-<!-- Replace the placeholder image below with the ModRadio screenshot when available. -->
 <p align="center">
-  <img width="100%" alt="ModRadio screenshot coming soon" src="docs/images/screenshot-placeholder.svg" />
+  <img width="1728" height="1080" alt="Screenshot 2026-09-16 at 14 45 31 (2)" src="https://github.com/user-attachments/assets/94fe0c51-b649-4cdc-b125-5e4053eabcd4" />
 </p>
 
 Discover a continuous stream of MOD and XM music from your menu bar. ModRadio
