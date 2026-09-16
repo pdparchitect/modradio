@@ -28,9 +28,9 @@ skip, seek, and adjust the volume from the menu or your Mac’s media controls.
 
 ## Download
 
-The first public build is being prepared for macOS 15 or later on Apple Silicon.
+**[Download ModRadio](https://github.com/pdparchitect/modradio/releases/latest)** for macOS 15 or later on Apple Silicon.
 
-When available, download `ModRadio-arm64.zip` from **[Releases](https://github.com/pdparchitect/modradio/releases)**, unzip it, and move ModRadio to **Applications**.
+Download `ModRadio-arm64.zip`, unzip it, and move ModRadio to **Applications**.
 
 See [Downloads and updates](docs/releases.md) for installation and update controls, or [Development](docs/development.md) to build from source.
 

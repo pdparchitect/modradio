@@ -6,5 +6,10 @@
     <true/>
     <key>com.apple.security.network.client</key>
     <true/>
+    <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+    <array>
+        <string>com.pdparchitect.modradio-spks</string>
+        <string>com.pdparchitect.modradio-spki</string>
+    </array>
 </dict>
 </plist>

@@ -10,9 +10,10 @@ application bundle.
   package manager or library installation on the user’s Mac.
 - `Support/` owns bundle metadata and the original Finder icon. The menu bar
   uses Apple’s native radio symbol for immediate recognition.
-- `Support/ModRadio.entitlements` enables App Sandbox and grants only outbound
-  network connections. No file, process automation, incoming network, personal
-  information, or device entitlements are present.
+- `Support/ModRadio.entitlements` enables App Sandbox, outbound network
+  connections, and two named connections to Sparkle’s update installer. No file,
+  process automation, incoming network, personal information, or device
+  entitlements are present.
 - `scripts/build-app.sh` builds the Swift package, assembles the app bundle,
   signs each embedded component, and verifies the bundle and sandbox policy.
 - `scripts/install-app.sh` replaces only `/Applications/ModRadio.app` and opens

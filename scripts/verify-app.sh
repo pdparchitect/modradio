@@ -57,13 +57,10 @@ components = [app, sparkle, installer, sparkle / 'Versions/B/Autoupdate', sparkl
 expected_entitlements = {
     'com.apple.security.app-sandbox': True,
     'com.apple.security.network.client': True,
-}
-# Release builds require the two installer connections; development builds may
-# be assembled with the existing sandbox policy before enabling the updater.
-if info['ModRadioUpdatesEnabled']:
-    expected_entitlements['com.apple.security.temporary-exception.mach-lookup.global-name'] = [
+    'com.apple.security.temporary-exception.mach-lookup.global-name': [
         'com.pdparchitect.modradio-spks', 'com.pdparchitect.modradio-spki'
-    ]
+    ],
+}
 team = None
 for component in components:
     subprocess.run(['codesign', '--verify', '--strict', str(component)], check=True)

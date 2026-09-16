@@ -1,6 +1,6 @@
 # Downloads and updates
 
-The first public build is being prepared. Downloads will be available from [GitHub Releases](https://github.com/pdparchitect/modradio/releases).
+Download the latest version from [GitHub Releases](https://github.com/pdparchitect/modradio/releases/latest).
 
 ## Install
 
